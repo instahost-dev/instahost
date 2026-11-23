@@ -1,0 +1,50 @@
+{
+  "name": "@instahost/cli",
+  "version": "0.1.0",
+  "description": "Instant hosting and sharing for AI agents: share a file or publish a static site and get an HTTPS URL. The unscoped npm package named instahost is unrelated.",
+  "keywords": ["hosting", "share", "static-site", "agents", "cli", "instahost"],
+  "license": "MIT",
+  "homepage": "https://instahost.dev/docs/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/instahost-dev/instahost.git",
+    "directory": "packages/cli"
+  },
+  "bugs": "https://github.com/instahost-dev/instahost/issues",
+  "type": "module",
+  "bin": {
+    "instahost": "./bin/instahost.mjs"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./paths": "./dist/vendor/paths.js",
+    "./node-check": "./src/node-check.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "src/vendor/paths.ts",
+    "src/node-check.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "node scripts/clean.mjs dist && tsc -p tsconfig.build.json",
+    "build:test": "node scripts/clean.mjs build && tsc -p tsconfig.test.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "pnpm run build && node --test test/*.test.ts",
+    "test:compiled": "node --test build/test/*.test.js",
+    "prepack": "pnpm run build"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.43",
+    "typescript": "6.0.3"
+  }
+}

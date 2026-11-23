@@ -1,0 +1,137 @@
+name: Release to npm
+
+# Pushing an annotated tag cli-vX.Y.Z on main publishes @instahost/cli X.Y.Z. The tag must match
+# packages/cli/package.json and the CLI's VERSION. The tarball that CI tested is the one published,
+# through npm trusted publishing (OIDC, no token), with a provenance attestation.
+#
+# One-time setup by the package owner:
+# - GitHub: an environment named `npm` whose deployment rule allows only tags matching `cli-v*`.
+# - npm: the package must exist before a trusted publisher can be added, so its first version is
+#   published by hand (2FA) from the tarball a CI run built. Then, in the package settings, add a
+#   GitHub Actions trusted publisher: organization instahost-dev, repository instahost, workflow
+#   release.yml, environment npm, with "npm publish" allowed (new configurations allow only staged
+#   publishing by default). A new configuration expires unless it publishes within 2 days, so push
+#   the next cli-v* tag soon after. Then require 2FA and disallow tokens for publishing.
+
+on:
+  push:
+    tags: ['cli-v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify-tag:
+    if: ${{ !github.event.deleted }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - name: Check the tag, the package version, VERSION and main
+        id: tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^cli-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "The tag $TAG is not cli-vX.Y.Z." >&2
+            exit 1
+          fi
+          version="${TAG#cli-v}"
+          git fetch --force --no-tags origin "refs/tags/$TAG:refs/tags/$TAG" refs/heads/main:refs/remotes/origin/main
+          if [[ "$(git cat-file -t "refs/tags/$TAG")" != tag ]]; then
+            echo "The tag $TAG is not annotated." >&2
+            exit 1
+          fi
+          sha="$(git rev-parse "refs/tags/$TAG^{commit}")"
+          if [[ "$sha" != "$(git rev-parse HEAD)" ]]; then
+            echo 'The fetched tag does not match the commit that triggered this run.' >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo "The tagged commit $sha is not on main." >&2
+            exit 1
+          fi
+          manifest="$(node -p 'require("./packages/cli/package.json").version')"
+          constant="$(sed -n 's/^export const VERSION = "\(.*\)";$/\1/p' packages/cli/src/config.ts)"
+          if [[ "$manifest" != "$version" || "$constant" != "$version" ]]; then
+            echo "Tag $version, package.json $manifest and VERSION $constant must be equal." >&2
+            exit 1
+          fi
+          if npm view "@instahost/cli@$version" version >/dev/null 2>&1; then
+            echo "@instahost/cli@$version is already on npm." >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          # shellcheck disable=SC2016 # backticks in the summary are Markdown
+          printf '## Release\n\n- Tag: `%s`\n- Commit: `%s`\n- Package: `@instahost/cli@%s`\n' "$TAG" "$sha" "$version" >> "$GITHUB_STEP_SUMMARY"
+
+  ci:
+    needs: verify-tag
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: [verify-tag, ci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cli-build
+      - name: Publish the tested tarball
+        env:
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          tar -xzf cli-build.tgz artifacts
+          tarball="artifacts/instahost-cli-$VERSION.tgz"
+          test -f "$tarball"
+          # Trusted publishing needs npm 11.5.1 or later.
+          npm_version="$(npm --version)"
+          if [[ "$(printf '%s\n' 11.5.1 "$npm_version" | sort -V | head -1)" != 11.5.1 ]]; then
+            echo "npm $npm_version is too old for trusted publishing." >&2
+            exit 1
+          fi
+          sha256sum "$tarball" | tee -a "$GITHUB_STEP_SUMMARY"
+          # --provenance makes npm refuse to publish when it cannot attest the build.
+          npm publish "$tarball" --access public --ignore-scripts --provenance
+      - name: Check the published version and its provenance
+        env:
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          # shellcheck disable=SC2016 # backticks in the summary are Markdown
+          for attempt in 1 2 3 4 5 6; do
+            if attestations="$(npm view "@instahost/cli@$VERSION" dist.attestations --json 2>/dev/null)" && [[ -n "$attestations" && "$attestations" != 'null' ]]; then
+              printf '%s\n' "$attestations"
+              printf -- '- Provenance: `%s`\n' "$(jq -r '.provenance.predicateType // "missing"' <<<"$attestations")" >> "$GITHUB_STEP_SUMMARY"
+              jq -e '.provenance.predicateType == "https://slsa.dev/provenance/v1"' <<<"$attestations" >/dev/null
+              exit 0
+            fi
+            sleep $((attempt * 10))
+          done
+          echo "@instahost/cli@$VERSION has no attestations on the registry." >&2
+          exit 1

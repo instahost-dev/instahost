@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Typecheck, test from source, build and pack (Node 24)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - run: pnpm install --frozen-lockfile
+      - name: Typecheck against the Node 20 API
+        run: pnpm -C packages/cli typecheck
+      - name: Build, then run the tests from the TypeScript sources
+        run: pnpm -C packages/cli test
+      - name: Compile the tests
+        run: pnpm -C packages/cli build:test
+      - name: Pack
+        run: |
+          mkdir -p artifacts
+          pnpm -C packages/cli pack --pack-destination "$PWD/artifacts"
+          node packages/cli/scripts/check-pack.mjs artifacts/instahost-cli-*.tgz
+      - name: Bundle the build for the Node matrix
+        run: tar -czf cli-build.tgz packages/cli/dist packages/cli/build artifacts
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cli-build
+          path: cli-build.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  node:
+    name: Compiled tests and packed install (Node ${{ matrix.node }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # latest is the newest Node.js release that is not a prerelease (setup-node's own `latest`
+        # would pick an alpha when one is out).
+        node: ['20.0.0', '22', '24', 'latest']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve the Node version
+        id: node
+        env:
+          WANT: ${{ matrix.node }}
+        run: |
+          version="$WANT"
+          if [[ "$WANT" == latest ]]; then
+            version="$(curl -fsSL --retry 3 https://nodejs.org/dist/index.json | jq -r '[.[] | select(.version | test("-") | not)][0].version')"
+            [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Could not resolve the latest Node.js release: $version" >&2; exit 1; }
+          fi
+          printf 'version=%s\n' "${version#v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cli-build
+      - run: tar -xzf cli-build.tgz
+      - name: Node version
+        env:
+          WANT: ${{ steps.node.outputs.version }}
+        run: |
+          node --version
+          npm --version
+          if [[ "$WANT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$(node --version)" != "v$WANT" ]]; then
+            echo "Expected exactly Node $WANT." >&2
+            exit 1
+          fi
+      - name: Run the compiled tests
+        working-directory: packages/cli
+        run: node --test build/test/*.test.js
+      - name: Install the packed tarball into an empty project and run it
+        run: node packages/cli/scripts/smoke-installed.mjs artifacts/instahost-cli-*.tgz
