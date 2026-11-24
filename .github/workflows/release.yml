@@ -108,7 +108,8 @@ jobs:
           VERSION: ${{ needs.verify-tag.outputs.version }}
         run: |
           tar -xzf cli-build.tgz artifacts
-          tarball="artifacts/instahost-cli-$VERSION.tgz"
+          # The leading ./ matters: npm reads "dir/name.tgz" as a GitHub owner/repo and tries git.
+          tarball="./artifacts/instahost-cli-$VERSION.tgz"
           test -f "$tarball"
           # Trusted publishing needs npm 11.5.1 or later.
           npm_version="$(npm --version)"

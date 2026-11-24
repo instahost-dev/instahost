@@ -75,6 +75,21 @@ describe("export surface (for InstaHost's own tests; not a supported SDK)", () =
   });
 });
 
+describe("the release workflow", () => {
+  const workflow = readFileSync(join(REPO_ROOT, ".github/workflows/release.yml"), "utf8");
+  it("publishes the tested tarball by a ./ path, which npm cannot mistake for a GitHub owner/repo", () => {
+    assert.match(workflow, /^\s+tarball="\.\/artifacts\/instahost-cli-\$VERSION\.tgz"$/m);
+    const publishes = [...workflow.matchAll(/^\s+npm publish (\S+)/gm)].map((m) => m[1]);
+    assert.deepEqual(publishes, ['"$tarball"']);
+    assert.match(workflow, /npm publish "\$tarball" --access public --ignore-scripts --provenance$/m);
+  });
+  it("publishes only from the protected npm environment, with an OIDC token", () => {
+    const job = workflow.slice(workflow.indexOf("\n  publish:"));
+    assert.match(job, /^    environment: npm$/m);
+    assert.match(job, /^      id-token: write$/m);
+  });
+});
+
 describe("the bin", () => {
   it("runs the compiled CLI with empty stderr", () => {
     assert.ok(existsSync(join(PACKAGE_ROOT, "dist/main.js")), "dist/main.js missing: build first");

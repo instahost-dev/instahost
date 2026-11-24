@@ -3,7 +3,7 @@
 // means the CLI asks for an API URL.
 import { usageError } from "./errors.ts";
 
-export const VERSION = "0.1.1";
+export const VERSION = "0.1.2";
 /**
  * The production API origin. The service's deploy preflight refuses to deploy an API origin that
  * differs from this value in the CLI version it pins, so changing the API domain needs a CLI release
