@@ -205,7 +205,9 @@ describe("the quick start", () => {
     const { dir, cleanup } = await tempDir();
     try {
       const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: dir, INSTAHOST_API_URL: fake.apiUrl, INSTAHOST_TEST_NODE: process.execPath, INSTAHOST_TEST_BIN: join(PACKAGE_ROOT, "bin/instahost.mjs") };
-      const child = spawn("bash", ["-euo", "pipefail", "-c", script], { cwd: dir, env });
+      // --norc and no stdin: Debian and Ubuntu builds of bash read /etc/bash.bashrc when stdin is a
+      // socket (as Node's piped stdin is), and that file breaks under -u.
+      const child = spawn("bash", ["--noprofile", "--norc", "-euo", "pipefail", "-c", script], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (d: Buffer) => (stdout += d));
