@@ -40,6 +40,8 @@ Install the skill into a project with the [skills](https://www.npmjs.com/package
 npx skills add instahost-dev/instahost
 ```
 
+It asks which agents to install to. Without a terminal, for example when an agent runs it, name the agent instead: `npx skills add instahost-dev/instahost -a claude-code -y` (or `-a cursor`, `-a codex`, `-a '*'` for all).
+
 The skill is [`skills/instahost/SKILL.md`](skills/instahost/SKILL.md); on older Node.js, copy it into your agent's skills directory. Agents without skills can use the commands above directly, or read [instahost.dev/llms.txt](https://instahost.dev/llms.txt). Without Node.js, the [HTTP quick start](https://instahost.dev/docs/#quickstart-http) needs only bash, curl and jq.
 
 ## What gets shared
