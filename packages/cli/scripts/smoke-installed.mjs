@@ -14,7 +14,7 @@ import { delimiter, dirname, join, resolve } from "node:path";
 const tarball = process.argv[2] ? resolve(process.argv[2]) : "";
 if (!tarball || !existsSync(tarball)) throw new Error("usage: node scripts/smoke-installed.mjs <tarball>");
 const version = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
-/** @type {{ startFake: (options?: object) => Promise<{ apiUrl: string, objects: Map<string, Buffer>, stop: () => Promise<void> }> }} */
+/** @type {{ startFake: (options?: object) => Promise<{ apiUrl: string, objects: Map<string, Buffer>, requests: unknown[], stop: () => Promise<void> }> }} */
 const { startFake } = await import(new URL("../build/test/fake-server.js", import.meta.url).href);
 
 const nodeBin = dirname(process.execPath);
@@ -95,6 +95,10 @@ try {
   await writeFile(join(site, "assets/a.css"), "h1{color:#123}\n");
   const blob = randomBytes(3 * 1024 * 1024 + 17);
   await writeFile(join(site, "assets/blob.bin"), blob);
+  const beforePreview = fake.requests.length;
+  const preview = await exec(bin, ["publish", "site", "--dry-run", "--json", "--api-url", fake.apiUrl], { cwd: project });
+  const plan = single(preview.stdout);
+  check("publish --dry-run: exit 0, one preview document, no requests", preview.code === 0 && preview.stderr === "" && plan?.ok === true && plan.dry_run === true && plan.file_count === 3 && fake.requests.length === beforePreview, JSON.stringify(preview));
   const publish = await exec(bin, ["publish", "site", "--ttl", "1h", "--json", "--api-url", fake.apiUrl], { cwd: project });
   const published = single(publish.stdout);
   check("publish a site with a 3 MiB asset (--json): exit 0, one document, empty stderr", publish.code === 0 && publish.stderr === "" && published?.ok === true && published.type === "site" && published.file_count === 3, JSON.stringify(publish));

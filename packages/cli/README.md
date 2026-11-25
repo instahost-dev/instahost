@@ -26,7 +26,7 @@ instahost publish ./dist --json
 
 ```text
 instahost share <file>    [--ttl 24h] [--access unlisted|public|private] [--name <filename>] [--content-type <type>]
-instahost publish <dir>   [--ttl 24h] [--access unlisted|public] [--include-dotfiles] [--concurrency 6]
+instahost publish <dir>   [--ttl 24h] [--access unlisted|public] [--include-dotfiles] [--concurrency 6] [--dry-run]
 instahost delete <id|url> [--token <ihd_...>]
 ```
 
@@ -54,6 +54,7 @@ A site is a directory with `index.html` at its root. Its pages must use relative
 | `--content-type <type>` | share | Declare the media type instead of deriving it from the extension. |
 | `--include-dotfiles` | publish | Also publish dot-prefixed files and directories. Credentials, VCS data and OS metadata stay excluded. |
 | `--concurrency <n>` | publish | Parallel uploads, 1 to 16 (default 6). |
+| `--dry-run` | publish | Show which files would be published and which skipped, without contacting InstaHost. |
 | `--token <ihd_...>` | delete | The artifact's delete token. |
 
 An option given to a command it does not belong to is a usage error. `delete` takes an artifact id or any of its URLs. Its credential is the first of `--token`, `--api-key`, `INSTAHOST_DELETE_TOKEN` and `INSTAHOST_API_KEY`; the environment keeps the token out of the process list.
@@ -75,6 +76,21 @@ An option given to a command it does not belong to is a usage error. `delete` ta
 - Both refuse a file that changes between hashing and upload.
 
 Detection is by name only: the CLI does not read file contents to find secrets. Publish a build output directory (`dist/`, `build/`, `out/`), never a repository root or home directory.
+
+## Preview a publish
+
+```sh
+npx -y @instahost/cli publish ./dist --dry-run --json
+```
+
+The preview runs every local check that `publish` runs: the options, the API key's format and the file checks, including `--include-dotfiles` if set. It then stops without contacting InstaHost, so it cannot create an artifact or confirm server-side limits, quotas or that the API key is accepted. Without `--json`, it prints included paths and sizes to stdout, and skips and warnings to stderr. With `--json`, it prints one document:
+
+```json
+{"ok": true, "dry_run": true, "type": "site", "files": [{"path": "index.html", "size": 42}],
+ "file_count": 1, "total_bytes": 42, "skipped": [{"path": ".env", "reason": "sensitive"}], "warnings": []}
+```
+
+Paths are relative to the site root and sizes are in bytes. Warnings can flag root-absolute URLs that may break if the published site is served under a path. Local failures use the usual error document and exit code.
 
 ## Output
 

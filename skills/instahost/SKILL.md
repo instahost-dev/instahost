@@ -5,7 +5,7 @@ description: Share a local file or publish a built static site and get an HTTPS 
 
 # InstaHost
 
-InstaHost turns a local file or a built static site into an HTTPS URL. There is no account and no login: anonymous links last 24 hours by default and at most 7 days. The CLI needs Node.js 20 or later and runs with `npx`.
+InstaHost turns a local file or a built static site into an HTTPS URL. No account or login is needed for temporary links. The CLI needs Node.js 20 or later and runs with `npx`.
 
 The npm package named `instahost` (without the `@instahost/` scope) is unrelated to this project. Always run `@instahost/cli`.
 
@@ -27,7 +27,13 @@ npx -y @instahost/cli share report.pdf --json
 
 The directory must have `index.html` at its root. Assets must use relative URLs (for Vite, set `base: "./"`).
 
-Publish only a build output directory such as `dist/`, `build/` or `out/`: never a repository root or a home directory. Everything in the directory becomes reachable by anyone with the link, apart from the dotfiles and credential names the CLI skips. List it first (for example `find ./dist -type f`) and check that every file is meant to be public.
+Publish only a build output directory such as `dist/`, `build/` or `out/`: never a repository root or a home directory. Preview it first:
+
+```sh
+npx -y @instahost/cli publish ./dist --dry-run --json
+```
+
+Check that every path in `files` is meant to be reachable by anyone who has the link, and review `skipped` and `warnings`. The preview is local: it makes no InstaHost API requests and cannot confirm server limits. Use the same directory and options for the real publish. If the preview fails, fix the problem before publishing. The one exception is a CLI older than 0.2.0, which rejects `--dry-run` as an unknown option: then list the directory instead (for example `find ./dist -type f`) and check every file the same way.
 
 ```sh
 npx -y @instahost/cli publish ./dist --json
@@ -57,7 +63,7 @@ Failure: `{"ok": false, "error": {"code": "...", "message": "...", "details": {.
 
 ## Lifetimes and access
 
-- `--ttl` takes a number with `s`, `m`, `h` or `d` (`30m`, `24h`, `7d`) or plain seconds. The default is 24 hours, the minimum 60 seconds and the anonymous maximum 7 days. `--ttl never` needs an API key.
+- `--ttl` takes a number with `s`, `m`, `h` or `d` (for example `30m` or `2h`), or plain seconds. `--ttl never` needs an API key.
 - `--access unlisted` (the default): anyone with the URL can open it; search engines are asked not to index it.
 - `--access public`: anyone with the URL can open it, and search engines may index it.
 - `--access private` (share only): the file opens only through `access_url`. Sites cannot be private.
@@ -101,7 +107,7 @@ INSTAHOST_DELETE_TOKEN=<delete_token> npx -y @instahost/cli delete <id or URL> -
 - Anyone who has an unlisted or public URL can open it. Treat every link as public.
 - Never upload credentials, keys, `.env` files or other private data unless the user explicitly asked for that file to be shared. The CLI refuses common credential names and skips dotfiles when publishing, but it checks names only, not contents.
 - Give the user the `url` (or `access_url` for a private file) and the expiry. Give the delete token or delete command only in a private reply to the user, never in a pull request, issue, commit, chat channel or anything else others can read; when posting a link publicly, post only the `url` and the expiry.
-- Anonymous limits apply per client: at most 100 MiB per file, 250 MiB and 500 files per artifact, and 50 artifacts a day. The current values are at https://instahost.dev/v1/limits.
+- Check https://instahost.dev/v1/limits for current lifetimes, file and site size limits, file counts and quotas.
 - An API key (`INSTAHOST_API_KEY`, `ihk_...`) allows longer lifetimes and higher limits. Use one only if the user provides it.
 
 Docs: https://instahost.dev/docs/

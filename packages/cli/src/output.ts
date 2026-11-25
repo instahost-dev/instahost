@@ -35,7 +35,18 @@ export interface DeletedDocument {
   deleted_at: string | null;
 }
 
-export type ResultDocument = PublishedDocument | DeletedDocument;
+export interface PublishPreviewDocument {
+  ok: true;
+  dry_run: true;
+  type: "site";
+  files: { path: string; size: number }[];
+  file_count: number;
+  total_bytes: number;
+  skipped: Skipped[];
+  warnings: Warning[];
+}
+
+export type ResultDocument = PublishedDocument | DeletedDocument | PublishPreviewDocument;
 
 export interface ErrorDocument {
   ok: false;
@@ -95,9 +106,17 @@ const SKIP_LABEL: Record<Skipped["reason"], string> = {
 // otherwise carry terminal escape sequences (clipboard writes, hidden or rewritten lines).
 export function printHuman(streams: Streams, doc: ResultDocument): void {
   const t = terminalSafe;
-  if ("delete_token" in doc) {
+  if ("skipped" in doc) {
     for (const s of doc.skipped) streams.stderr(`skipped  ${t(s.path)}  (${SKIP_LABEL[s.reason]})\n`);
     for (const w of doc.warnings) streams.stderr(`warning  ${t(w.message)}${w.paths?.length ? `: ${t(w.paths.join(", "))}` : ""}\n`);
+  }
+  if ("dry_run" in doc) {
+    const lines = [`Dry run: would publish ${doc.file_count} file(s) (${doc.total_bytes} bytes). Nothing uploaded.`];
+    for (const file of doc.files) lines.push(`  ${t(file.path)}  (${file.size} bytes)`);
+    streams.stdout(`${lines.join("\n")}\n`);
+    return;
+  }
+  if ("delete_token" in doc) {
     const lines = [`URL      ${t(doc.url)}`];
     if (doc.access_url) lines.push(`Access   ${t(doc.access_url)}`);
     lines.push(`Expires  ${doc.expires_at ?? "never"}`, `Delete   ${DELETE_COMMAND} ${doc.id} --token ${t(doc.delete_token)}`);

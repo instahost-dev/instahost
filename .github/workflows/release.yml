@@ -1,8 +1,15 @@
 name: Release to npm
 
 # Pushing an annotated tag cli-vX.Y.Z on main publishes @instahost/cli X.Y.Z. The tag must match
-# packages/cli/package.json and the CLI's VERSION. The tarball that CI tested is the one published,
-# through npm trusted publishing (OIDC, no token), with a provenance attestation.
+# packages/cli/package.json and the CLI's VERSION and have notes in CHANGELOG.md. The tarball that
+# CI tested is published through npm trusted publishing (OIDC, no token), with a provenance
+# attestation verified before the GitHub Release is created.
+#
+# If npm accepted the package but the publish job then failed (for example, the provenance check
+# timed out), re-running cannot publish again, so github-release never runs. From a checkout of the
+# tag, confirm the attestation, then create the release by hand:
+#   npm view @instahost/cli@X.Y.Z dist.attestations
+#   node packages/cli/scripts/release-notes.mjs X.Y.Z | gh release create cli-vX.Y.Z --verify-tag --title cli-vX.Y.Z --notes-file -
 #
 # One-time setup by the package owner:
 # - GitHub: an environment named `npm` whose deployment rule allows only tags matching `cli-v*`.
@@ -44,7 +51,7 @@ jobs:
         with:
           node-version-file: .node-version
           package-manager-cache: false
-      - name: Check the tag, the package version, VERSION and main
+      - name: Check the tag, branch, versions and changelog
         id: tag
         env:
           TAG: ${{ github.ref_name }}
@@ -74,6 +81,7 @@ jobs:
             echo "Tag $version, package.json $manifest and VERSION $constant must be equal." >&2
             exit 1
           fi
+          node packages/cli/scripts/release-notes.mjs "$version" >/dev/null
           if npm view "@instahost/cli@$version" version >/dev/null 2>&1; then
             echo "@instahost/cli@$version is already on npm." >&2
             exit 1
@@ -136,3 +144,37 @@ jobs:
           done
           echo "@instahost/cli@$VERSION has no attestations on the registry." >&2
           exit 1
+
+  github-release:
+    needs: [verify-tag, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - name: Prepare release notes
+        env:
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: node packages/cli/scripts/release-notes.mjs "$VERSION" > "$RUNNER_TEMP/cli-release-notes.md"
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if is_draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [[ "$is_draft" == false ]]; then
+              echo "The GitHub Release for $TAG already exists."
+              exit 0
+            fi
+            echo "A draft already uses $TAG; publish or remove it before retrying." >&2
+            exit 1
+          fi
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/cli-release-notes.md"

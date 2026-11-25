@@ -132,6 +132,73 @@ describe("share", () => {
 });
 
 describe("publish", () => {
+  it("previews the publish manifest and skips without contacting the API or storage", async () => {
+    const target = join(dir, "preview-site");
+    const index = '<script src="/app.js"></script>';
+    await writeTree(target, { "index.html": index, "app.js": "1", ".hidden": "h", ".env": "SECRET=1", ".DS_Store": "metadata" });
+    await withFake({}, async (fake) => {
+      const args = ["publish", target, "--json", "--api-url", fake.apiUrl];
+      const preview = await run([...args, "--dry-run"]);
+      assert.deepEqual([preview.code, preview.stderr], [0, ""], preview.stdout);
+      const { warnings, ...plan } = preview.json;
+      assert.deepEqual(plan, {
+        ok: true,
+        dry_run: true,
+        type: "site",
+        files: [{ path: "app.js", size: 1 }, { path: "index.html", size: Buffer.byteLength(index) }],
+        file_count: 2,
+        total_bytes: 1 + Buffer.byteLength(index),
+        skipped: [{ path: ".DS_Store", reason: "os_metadata" }, { path: ".env", reason: "sensitive" }, { path: ".hidden", reason: "dotfile" }],
+      });
+      assert.equal(warnings.length, 1);
+      assert.equal(warnings[0].code, "root_absolute_reference");
+      assert.match(warnings[0].message, /can break when a site is served under a path/);
+      assert.deepEqual(warnings[0].paths, ["index.html"]);
+
+      const withDotfiles = await run([...args, "--dry-run", "--include-dotfiles"]);
+      assert.equal(withDotfiles.code, 0, withDotfiles.stdout);
+      assert.deepEqual(withDotfiles.json.files, [{ path: ".hidden", size: 1 }, ...plan.files]);
+      assert.equal(fake.requests.length, 0);
+
+      const published = await run([...args, "--include-dotfiles"]);
+      assert.equal(published.code, 0, published.stdout);
+      const create = apiRequests(fake, "/v1/artifacts")[0];
+      assert.ok(create);
+      const files = JSON.parse(create.body.toString()).files as { path: string; size: number }[];
+      assert.deepEqual(files.map(({ path, size }) => ({ path, size })), withDotfiles.json.files);
+      assert.deepEqual(published.json.skipped, withDotfiles.json.skipped);
+    });
+  });
+
+  it("prints a human preview: included files on stdout, skipped paths on stderr", async () => {
+    const target = join(dir, "human-preview");
+    await writeTree(target, { "index.html": "hello", ".env": "SECRET=1" });
+    await withFake({}, async (fake) => {
+      const preview = await run(["publish", target, "--dry-run", "--api-url", fake.apiUrl], { tty: true });
+      assert.equal(preview.code, 0, preview.stderr);
+      assert.equal(preview.stdout, "Dry run: would publish 1 file(s) (5 bytes). Nothing uploaded.\n  index.html  (5 bytes)\n");
+      assert.equal(preview.stderr, "skipped  .env  (looks like a credential or VCS data)\n");
+      assert.equal(fake.requests.length, 0);
+    });
+  });
+
+  it("refuses malformed API settings exactly as a publish does, so a passing preview means the publish passes them too", async () => {
+    await withFake({}, async (fake) => {
+      const cases: [string[], NodeJS.ProcessEnv][] = [
+        [["--api-url", fake.apiUrl, "--api-key", "invalid"], {}],
+        [["--api-url", fake.apiUrl], { INSTAHOST_API_KEY: "invalid" }],
+        [[], { INSTAHOST_API_URL: "invalid" }],
+      ];
+      for (const [flags, env] of cases) {
+        const published = await run(["publish", join(dir, "site"), "--json", ...flags], { env });
+        assert.deepEqual([published.code, published.json.error.code], [2, "usage"], published.stdout);
+        const preview = await run(["publish", join(dir, "site"), "--json", "--dry-run", ...flags], { env });
+        assert.deepEqual([preview.code, preview.json], [published.code, published.json]);
+      }
+      assert.equal(fake.requests.length, 0);
+    });
+  });
+
   it("uploads in batches requested just before use, at most --concurrency at a time, skipping sensitive files", async () => {
     await withFake({ batchSize: 50 }, async (fake) => {
       const r = await run(["publish", join(dir, "site"), "--json", "--api-url", fake.apiUrl, "--concurrency", "4"]);
@@ -342,13 +409,16 @@ describe("publish", () => {
       const { dir: d, cleanup: done } = await tempDir();
       try {
         await writeTree(d, { "empty/.env": "x", "noindex/page.html": "x" });
-        assert.equal((await run(["publish", join(dir, "site"), "--access", "private", "--json", "--api-url", fake.apiUrl])).json.error.exit_code, 2);
-        const empty = await run(["publish", join(d, "empty"), "--json", "--api-url", fake.apiUrl]);
-        assert.deepEqual([empty.code, empty.json.error.code], [3, "empty_directory"]);
-        const noIndex = await run(["publish", join(d, "noindex"), "--json", "--api-url", fake.apiUrl]);
-        assert.deepEqual([noIndex.code, noIndex.json.error.code], [3, "missing_index"]);
-        const file = await run(["publish", join(dir, "notes.txt"), "--json", "--api-url", fake.apiUrl]);
-        assert.deepEqual([file.code, file.json.error.code], [3, "not_a_directory"]);
+        for (const flags of [[], ["--dry-run"]]) {
+          const args = ["publish", "--json", "--api-url", fake.apiUrl, ...flags];
+          assert.equal((await run([...args, join(dir, "site"), "--access", "private"])).json.error.exit_code, 2);
+          const empty = await run([...args, join(d, "empty")]);
+          assert.deepEqual([empty.code, empty.json.error.code], [3, "empty_directory"]);
+          const noIndex = await run([...args, join(d, "noindex")]);
+          assert.deepEqual([noIndex.code, noIndex.json.error.code], [3, "missing_index"]);
+          const file = await run([...args, join(dir, "notes.txt")]);
+          assert.deepEqual([file.code, file.json.error.code], [3, "not_a_directory"]);
+        }
         assert.equal(fake.requests.length, 0);
       } finally {
         await done();
@@ -407,6 +477,8 @@ describe("--json purity and diagnostics", () => {
       [["share", "x", "--json", "--api-url", "ftp://instahost.example"], 2], // not an https API URL
       [["publish", "x", "--ttl", "1w", "--json", "--api-url", "http://127.0.0.1:9"], 2],
       [["delete", "x", "--name", "y", "--json"], 2],
+      [["delete", "x", "--dry-run", "--json"], 2],
+      [["share", join(dir, "notes.txt"), "--dry-run", "--json"], 2],
       [["share", join(dir, "notes.txt"), "--include-dotfiles", "--json", "--api-url", "http://127.0.0.1:9"], 2], // option of another command
       [["publish", join(dir, "site"), "--concurrency", "17", "--json", "--api-url", "http://127.0.0.1:9"], 2],
       [["publish", join(dir, "site"), "--concurrency", "0", "--json", "--api-url", "http://127.0.0.1:9"], 2],
