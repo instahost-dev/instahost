@@ -77,6 +77,7 @@ describe("export surface (for InstaHost's own tests; not a supported SDK)", () =
 
 describe("the release workflow", () => {
   const workflow = readFileSync(join(REPO_ROOT, ".github/workflows/release.yml"), "utf8");
+  const releaseJob = workflow.slice(workflow.indexOf("\n  github-release:"));
   it("publishes the tested tarball by a ./ path, which npm cannot mistake for a GitHub owner/repo", () => {
     assert.match(workflow, /^\s+tarball="\.\/artifacts\/instahost-cli-\$VERSION\.tgz"$/m);
     const publishes = [...workflow.matchAll(/^\s+npm publish (\S+)/gm)].map((m) => m[1]);
@@ -84,9 +85,27 @@ describe("the release workflow", () => {
     assert.match(workflow, /npm publish "\$tarball" --access public --ignore-scripts --provenance$/m);
   });
   it("publishes only from the protected npm environment, with an OIDC token", () => {
-    const job = workflow.slice(workflow.indexOf("\n  publish:"));
+    const job = workflow.slice(workflow.indexOf("\n  publish:"), workflow.indexOf("\n  github-release:"));
     assert.match(job, /^    environment: npm$/m);
     assert.match(job, /^      id-token: write$/m);
+    assert.doesNotMatch(job, /^      contents: write$/m);
+  });
+  it("creates notes on an existing tag only after the verified npm publish", () => {
+    assert.match(releaseJob, /^    needs: \[verify-tag, publish\]$/m);
+    assert.match(releaseJob, /^      contents: write$/m);
+    assert.doesNotMatch(releaseJob, /id-token: write/);
+    assert.match(releaseJob, /gh release create "\$TAG" --verify-tag .*--notes-file /);
+  });
+  it("extracts only the matching changelog section and refuses missing notes", () => {
+    const notes = join(PACKAGE_ROOT, "scripts/release-notes.mjs");
+    const current = spawnSync(process.execPath, [notes, manifest.version], { encoding: "utf8" });
+    const changelog = readFileSync(join(REPO_ROOT, "CHANGELOG.md"), "utf8");
+    const expected = changelog.split(`\n## ${manifest.version}\n`)[1]?.split("\n## ")[0]?.trim();
+    assert.ok(expected);
+    assert.deepEqual([current.status, current.stdout, current.stderr], [0, `${expected}\n`, ""]);
+    const missing = spawnSync(process.execPath, [notes, "9999.9999.9999"], { encoding: "utf8" });
+    assert.deepEqual([missing.status, missing.stdout], [1, ""]);
+    assert.match(missing.stderr, /CHANGELOG\.md/);
   });
 });
 

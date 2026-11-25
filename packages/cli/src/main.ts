@@ -11,14 +11,14 @@ import { type Lifetime, parseTtl } from "./ttl.ts";
 import { DEFAULT_CONCURRENCY } from "./upload.ts";
 import type { CommandContext } from "./commands/context.ts";
 import { deleteArtifact } from "./commands/delete.ts";
-import { publish } from "./commands/publish.ts";
+import { previewPublish, publish } from "./commands/publish.ts";
 import { share } from "./commands/share.ts";
 
 export const HELP = `instahost ${VERSION}: instant hosting and sharing for AI agents.
 
 Usage:
   instahost share <file>    [--ttl 24h] [--access unlisted|public|private] [--name <filename>] [--content-type <type>]
-  instahost publish <dir>   [--ttl 24h] [--access unlisted|public] [--include-dotfiles] [--concurrency 6]
+  instahost publish <dir>   [--ttl 24h] [--access unlisted|public] [--include-dotfiles] [--concurrency 6] [--dry-run]
   instahost delete <id|url> [--token <ihd_...>]   (or the owner's API key)
 
 Options for every command:
@@ -31,6 +31,7 @@ Options for every command:
 Anonymous artifacts live 24 hours by default and at most 7 days.
 publish skips dotfiles (except .well-known), credentials (.env*, keys, .git, ...) and OS metadata,
 and lists them under "skipped". Sites must use relative URLs (Vite: base: "./").
+publish --dry-run lists what would be published or skipped without contacting InstaHost.
 delete uses --token, else --api-key, else INSTAHOST_DELETE_TOKEN, else INSTAHOST_API_KEY; the
 environment keeps the token out of the process list.
 
@@ -59,6 +60,7 @@ export const OPTIONS = {
   "content-type": { type: "string" },
   "include-dotfiles": { type: "boolean" },
   concurrency: { type: "string" },
+  "dry-run": { type: "boolean" },
   token: { type: "string" },
 } as const;
 
@@ -74,7 +76,7 @@ export const GLOBAL = ["json", "api-url", "api-key", "verbose", "help", "version
 /** Options per command, on top of GLOBAL. */
 export const PER_COMMAND: Record<string, string[]> = {
   share: ["ttl", "access", "name", "content-type"],
-  publish: ["ttl", "access", "include-dotfiles", "concurrency"],
+  publish: ["ttl", "access", "include-dotfiles", "concurrency", "dry-run"],
   delete: ["token"],
 };
 
@@ -155,13 +157,15 @@ async function run(argv: string[], deps: Required<Pick<MainDeps, "env">> & MainD
     if (values.access === "private") throw usageError("Private sites are not supported; publish with --access unlisted or public, or share single files privately.");
     const concurrency = values.concurrency === undefined ? DEFAULT_CONCURRENCY : Number(values.concurrency);
     if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 16) throw usageError("--concurrency must be an integer from 1 to 16.");
-    return publish(ctx, {
+    const options = {
       dir: target,
       lifetime,
       access: choice("access", values.access, ["unlisted", "public"] as const, "unlisted"),
       includeDotfiles: values["include-dotfiles"] ?? false,
       concurrency,
-    });
+    };
+    // A dry run has passed the same option and API key checks as a publish; it stops before any request.
+    return values["dry-run"] ? previewPublish(options) : publish(ctx, options);
   }
   if (command === "delete") {
     // Flags before the environment: --token, then --api-key, then

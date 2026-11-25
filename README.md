@@ -71,7 +71,7 @@ pnpm check
 
 ## Releases
 
-A release is an annotated tag `cli-vX.Y.Z` on `main` that matches `packages/cli/package.json` and the CLI's `VERSION`. The release workflow repeats the CI checks and publishes the tested tarball to npm through trusted publishing, with a provenance attestation, from the protected `npm` environment. The one-time owner setup is described at the top of [`release.yml`](.github/workflows/release.yml).
+A release is an annotated tag `cli-vX.Y.Z` on `main` that matches `packages/cli/package.json` and the CLI's `VERSION`. Before tagging, add one nonempty `## X.Y.Z` section to [CHANGELOG.md](CHANGELOG.md). The release workflow repeats CI and publishes the tested tarball through npm trusted publishing from the protected `npm` environment. After verifying npm provenance, it creates a GitHub Release for the tag using that changelog section. If only that final job fails, re-run it: it does not publish to npm again. If the publish job fails after npm accepted the package, re-running cannot help, because npm refuses the same version twice; create the GitHub Release by hand as described at the top of [`release.yml`](.github/workflows/release.yml), which also describes the one-time owner setup.
 
 ## Security
 

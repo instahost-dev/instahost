@@ -181,6 +181,29 @@ describe("documented results", () => {
     }
   });
 
+  it("show exactly the fields of a real publish preview", async () => {
+    const fake = await startFake();
+    const { dir, cleanup } = await tempDir();
+    try {
+      await writeTree(dir, { "index.html": "hello", ".env": "x" });
+      const r = await run(["publish", dir, "--dry-run", "--json", "--api-url", fake.apiUrl]);
+      assert.equal(r.code, 0, r.stdout);
+      const readme = read("packages/cli/README.md");
+      const at = readme.indexOf("\n## Preview a publish\n");
+      assert.ok(at >= 0, "heading ## Preview a publish missing");
+      const example = blocks(readme.slice(at, readme.indexOf("\n## ", at + 1))).find((b) => b.lang === "json");
+      assert.ok(example, "no JSON example under ## Preview a publish");
+      const shown = JSON.parse(example.body) as Record<string, any>;
+      const keys = (o: object) => Object.keys(o).sort();
+      assert.deepEqual(keys(shown), keys(r.json), "packages/cli/README.md preview example");
+      for (const list of ["files", "skipped"]) assert.deepEqual(keys(shown[list][0]), keys(r.json[list][0]), `preview example: ${list}`);
+      assert.equal(fake.requests.length, 0);
+    } finally {
+      await cleanup();
+      await fake.stop();
+    }
+  });
+
   for (const doc of ["packages/cli/README.md", "skills/instahost/SKILL.md"]) {
     it(`${doc} documents every exit code`, () => {
       const text = read(doc);
