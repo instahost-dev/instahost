@@ -19,7 +19,8 @@ try {
   // A damaged or partial install (dist/ missing or unreadable): still exactly one answer.
   const code = (err && typeof err === "object" && "code" in err && typeof err.code === "string") ? err.code : "unknown";
   const message = `The CLI could not load its compiled files (${code}); reinstall it: npx -y @instahost/cli@latest, or npm i -g @instahost/cli.`;
-  if (json) process.stdout.write(`${JSON.stringify({ ok: false, error: { code: "cli_load_failed", message, details: { reason: code }, exit_code: 1 } })}\n`);
+  const fix = "Reinstall the CLI with `npx -y @instahost/cli@latest` or `npm i -g @instahost/cli`.";
+  if (json) process.stdout.write(`${JSON.stringify({ ok: false, error: { code: "cli_load_failed", message, details: { reason: code }, fix, exit_code: 1 } })}\n`);
   else process.stderr.write(`instahost: ${message}\n`);
   process.exit(1);
 }

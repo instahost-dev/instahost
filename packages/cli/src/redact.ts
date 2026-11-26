@@ -7,12 +7,16 @@ const SIGNED_PARAM = /\b(X-Amz-(?:Signature|Credential|Security-Token))=[^&\s"']
 const TOKEN_PARAM = /([?&]token=)[^&\s"']+/gi;
 const BEARER = /\b(Bearer\s+)[^\s"']+/gi;
 
-export function redact(text: string): string {
+/** Masks credentials without swallowing placeholders in guidance such as `Bearer <token>`. */
+export function redactCredentials(text: string): string {
   return text
     .replace(TOKEN, (_m, kind: string) => `ih${kind}_***`)
     .replace(SIGNED_PARAM, "$1=***")
-    .replace(TOKEN_PARAM, "$1***")
-    .replace(BEARER, "$1***");
+    .replace(TOKEN_PARAM, "$1***");
+}
+
+export function redact(text: string): string {
+  return redactCredentials(text).replace(BEARER, "$1***");
 }
 
 /** A URL safe for diagnostics: origin and path only (no query string, which may hold a signature). */

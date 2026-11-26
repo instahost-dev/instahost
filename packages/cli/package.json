@@ -1,6 +1,6 @@
 {
   "name": "@instahost/cli",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Instant hosting and sharing for AI agents: share a file or publish a static site and get an HTTPS URL. The unscoped npm package named instahost is unrelated.",
   "keywords": ["hosting", "share", "static-site", "agents", "cli", "instahost"],
   "license": "MIT",

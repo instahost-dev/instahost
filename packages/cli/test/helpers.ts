@@ -34,7 +34,7 @@ export interface Run {
 }
 
 /** Runs main() in-process with captured streams and a sleep that only records. */
-export async function run(argv: string[], options: { env?: NodeJS.ProcessEnv; tty?: boolean } = {}): Promise<Run> {
+export async function run(argv: string[], options: { env?: NodeJS.ProcessEnv; tty?: boolean; fetch?: typeof fetch } = {}): Promise<Run> {
   let stdout = "";
   let stderr = "";
   const sleeps: number[] = [];
@@ -42,6 +42,7 @@ export async function run(argv: string[], options: { env?: NodeJS.ProcessEnv; tt
     env: options.env ?? {},
     streams: { stdout: (t) => void (stdout += t), stderr: (t) => void (stderr += t), stderrIsTty: options.tty ?? false },
     sleep: async (s) => void sleeps.push(s),
+    fetch: options.fetch,
   });
   return {
     code,

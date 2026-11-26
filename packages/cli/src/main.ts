@@ -34,6 +34,7 @@ and lists them under "skipped". Sites must use relative URLs (Vite: base: "./").
 publish --dry-run lists what would be published or skipped without contacting InstaHost.
 delete uses --token, else --api-key, else INSTAHOST_DELETE_TOKEN, else INSTAHOST_API_KEY; the
 environment keeps the token out of the process list.
+On a failure, error.fix in the JSON output says what to do next.
 
 Exit codes: 0 ok, 1 internal error, 2 usage, 3 local input (missing file, no index.html, invalid or
 sensitive name), 4 authentication or authorization (401, 403), 5 rejected by the server (400, 413,
@@ -181,13 +182,13 @@ const progress = { open: false };
 
 /**
  * Last resort for a real process: an error that escapes main() still ends as one JSON document
- * (or one stderr line) and exit code 1, never a Node stack trace on stdout.
+ * (or a human-readable error) and exit code 1.
  */
 function installCrashHandlers(argv: string[], streams: Streams): void {
   const crash = (err: unknown) => {
-    const doc = errorDocument(new CliError("internal_error", `Unexpected error: ${err instanceof Error ? err.name : "unknown"}`, EXIT.internal));
-    if (argv.includes("--json")) printJson(streams, doc);
-    else streams.stderr(`instahost: ${doc.error.message}\n`);
+    const error = CliError.local("internal_error", `Unexpected error: ${err instanceof Error ? err.name : "unknown"}`, EXIT.internal);
+    if (argv.includes("--json")) printJson(streams, errorDocument(error));
+    else printHumanError(streams, error);
     process.exit(EXIT.internal);
   };
   process.once("uncaughtException", crash);
@@ -206,7 +207,7 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<number>
       progress.open = false;
     }
     const cliError =
-      err instanceof CliError ? err : new CliError("internal_error", `Unexpected error: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`, EXIT.internal);
+      err instanceof CliError ? err : CliError.local("internal_error", `Unexpected error: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`, EXIT.internal);
     if (json) printJson(streams, errorDocument(cliError));
     else printHumanError(streams, cliError);
     if (argv.includes("--verbose") && !(err instanceof CliError) && err instanceof Error && err.stack) streams.stderr(`${redact(err.stack)}\n`);

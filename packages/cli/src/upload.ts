@@ -13,6 +13,7 @@
 //   (the local R2 emulator); they never get an Authorization header.
 // - /complete answering 409 upload_incomplete re-uploads details.missing, then completes again, at
 //   most 3 complete calls in all (the server allows MAX_COMPLETE_ATTEMPTS = 4).
+import { randomUUID } from "node:crypto";
 import { openAsBlob } from "node:fs";
 import { lstat } from "node:fs/promises";
 import { type ApiClient, BACKOFF_SECONDS, RETRIES } from "./api-client.ts";
@@ -112,12 +113,12 @@ export function checkUploadUrl(raw: string, apiUrl: string): URL {
   try {
     url = new URL(raw);
   } catch {
-    throw new CliError("unsafe_url", "The API returned an invalid upload URL.", EXIT.network);
+    throw CliError.local("unsafe_url", "The API returned an invalid upload URL.", EXIT.network);
   }
   const api = new URL(apiUrl);
   const localHttp = url.protocol === "http:" && isLoopbackHost(url.hostname) && api.protocol === "http:" && isLoopbackHost(api.hostname);
   if (url.protocol !== "https:" && !localHttp) {
-    throw new CliError("unsafe_url", "The API returned an upload URL that is not https.", EXIT.network, { url: describeUrl(raw) });
+    throw CliError.local("unsafe_url", "The API returned an upload URL that is not https.", EXIT.network, { url: describeUrl(raw) });
   }
   return url;
 }
@@ -130,7 +131,7 @@ export function checkBatch(batch: unknown, where: string): asserts batch is Inst
     typeof b.expires_at === "string" &&
     Array.isArray(b.files) &&
     b.files.every((f) => f && typeof f.path === "string" && typeof f.url === "string" && f.method === "PUT" && f.headers !== null && typeof f.headers === "object");
-  if (!ok) throw new CliError("bad_response", `The API's answer to ${where} has no valid upload instructions.`, EXIT.network);
+  if (!ok) throw CliError.local("bad_response", `The API's answer to ${where} has no valid upload instructions.`, EXIT.network);
 }
 
 /** The fields read from a create answer (batch_size must be at least 1, or batching never ends). */
@@ -145,13 +146,20 @@ export function checkCreated(created: unknown): asserts created is CreateRespons
     u.batch_size >= 1 &&
     typeof u.uploads_url === "string" &&
     typeof u.complete_url === "string";
-  if (!ok) throw new CliError("bad_response", "The API's answer to create is incomplete.", EXIT.network);
+  if (!ok) throw CliError.local("bad_response", "The API's answer to create is incomplete.", EXIT.network);
+}
+
+/** Give each invocation one create key for the original request and any retries. */
+export async function createArtifact(client: ApiClient, body: unknown, token: string | null): Promise<CreateResponse> {
+  const created = await client.call<CreateResponse>("POST", "/v1/artifacts", { body, token, phase: "create", idempotencyKey: randomUUID() });
+  checkCreated(created);
+  return created;
 }
 
 /** The fields read from a published artifact. */
 export function checkArtifact(artifact: unknown, where: string): asserts artifact is AuthorizedArtifact {
   const a = artifact as Partial<AuthorizedArtifact> | null | undefined;
-  if (!a || typeof a.id !== "string" || typeof a.url !== "string") throw new CliError("bad_response", `The API's answer to ${where} has no artifact.`, EXIT.network);
+  if (!a || typeof a.id !== "string" || typeof a.url !== "string") throw CliError.local("bad_response", `The API's answer to ${where} has no artifact.`, EXIT.network);
 }
 
 class Uploader {
@@ -202,7 +210,6 @@ class Uploader {
       const r = await this.#s.client.call<{ upload: InstructionBatch }>("POST", this.#s.created.upload.uploads_url, {
         body: { paths: paths.slice(i, i + size) },
         token: this.#token,
-        idempotent: true,
         phase: "publish",
       });
       checkBatch(r?.upload, "/uploads");
@@ -291,7 +298,7 @@ class Uploader {
     let retries = 0;
     for (;;) {
       const cached = this.#cache.get(file.path);
-      if (!cached) throw new CliError("bad_response", `The API returned no upload URL for ${file.path}.`, EXIT.network, { path: file.path });
+      if (!cached) throw CliError.local("bad_response", `The API returned no upload URL for ${file.path}.`, EXIT.network, { path: file.path });
       // A URL about to expire is replaced before use (once: near the end of the upload window the
       // server only issues short-lived URLs, which are then used as they are).
       if (!refreshedBeforeUse && this.#stale(file.path)) {
@@ -342,7 +349,7 @@ class Uploader {
         throw inputError("file_changed", `${file.path} changed since it was hashed (storage refused its checksum); try again.`, { path: file.path });
       }
       const reason = status === 0 ? `network error (${detail})` : `HTTP ${status}${detail ? ` ${detail}` : ""}`;
-      throw new CliError("upload_failed", `Uploading ${file.path} failed: ${reason}.`, EXIT.network, { path: file.path, status: status || null, s3_code: status ? detail : null });
+      throw CliError.local("upload_failed", `Uploading ${file.path} failed: ${reason}.`, EXIT.network, { path: file.path, status: status || null, s3_code: status ? detail : null });
     }
   }
 
@@ -364,7 +371,7 @@ export async function afterCreate<T>(created: CreateResponse, step: () => Promis
   try {
     return await step();
   } catch (err) {
-    const error = err instanceof CliError ? err : new CliError("internal_error", `Unexpected error: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`, EXIT.internal);
+    const error = err instanceof CliError ? err : CliError.local("internal_error", `Unexpected error: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`, EXIT.internal);
     error.artifact = { id: created.artifact.id, url: created.artifact.url, delete_token: created.delete_token, access_url: created.access_url ?? null };
     throw error;
   }
@@ -383,7 +390,6 @@ export async function uploadAndComplete(session: PublishSession): Promise<Author
     try {
       const r = await session.client.call<{ artifact: AuthorizedArtifact }>("POST", session.created.upload.complete_url, {
         token: manageToken(session),
-        idempotent: true,
         phase: "publish",
       });
       checkArtifact(r?.artifact, "complete");

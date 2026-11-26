@@ -7,7 +7,7 @@ import { inputError } from "../errors.ts";
 import { sensitiveRule } from "../vendor/paths.ts";
 import type { PublishPreviewDocument, PublishedDocument, Warning } from "../output.ts";
 import { type Lifetime, lifetimeFields } from "../ttl.ts";
-import { type CreateResponse, afterCreate, checkCreated, uploadAndComplete } from "../upload.ts";
+import { afterCreate, createArtifact, uploadAndComplete } from "../upload.ts";
 import { type RootAbsoluteReference, findRootAbsoluteReferences, walkSite } from "../walk.ts";
 import type { CommandContext } from "./context.ts";
 
@@ -70,13 +70,12 @@ export async function previewPublish(options: SiteOptions): Promise<PublishPrevi
 
 export async function publish(ctx: CommandContext, options: PublishOptions): Promise<PublishedDocument> {
   const walked = await prepareSite(options);
-  const created = await ctx.client.call<CreateResponse>("POST", "/v1/artifacts", {
-    body: { type: "site", access: options.access, ...lifetimeFields(options.lifetime), files: walked.files.map((f) => ({ path: f.path, size: f.size, md5: f.md5 })) },
-    token: ctx.apiKey,
-    idempotent: false,
-    phase: "create",
-  });
-  checkCreated(created);
+  const created = await createArtifact(ctx.client, {
+    type: "site",
+    access: options.access,
+    ...lifetimeFields(options.lifetime),
+    files: walked.files.map((f) => ({ path: f.path, size: f.size, md5: f.md5 })),
+  }, ctx.apiKey);
   const artifact = await afterCreate(created, () =>
     uploadAndComplete({
       client: ctx.client,

@@ -59,7 +59,11 @@ Success (share and publish):
 | `skipped` | Files `publish` left out, as `{path, reason}`. |
 | `warnings` | Problems worth telling the user about, as `{code, message, paths}`. |
 
-Failure: `{"ok": false, "error": {"code": "...", "message": "...", "details": {...}, "exit_code": 5}}`. When `error.details.artifact` is present, the failure happened after the artifact was created; delete it with `error.details.artifact.delete_token`.
+Failure: `{"ok": false, "error": {"code": "...", "message": "...", "fix": "...", "docs": "...", "exit_code": 4}}`.
+
+### Handle a failure
+
+Follow `error.fix` and look up any values it names in `error.details`. When `error.details.artifact` is present, delete that artifact with its `delete_token`. If the fix calls for waiting more than about a minute or obtaining a credential, tell the user what `error.fix` says. Use `error.message` on CLI versions older than 0.3.0, which lack `error.fix`. An API error can include an `error.docs` link.
 
 ## Lifetimes and access
 
@@ -93,13 +97,13 @@ INSTAHOST_DELETE_TOKEN=<delete_token> npx -y @instahost/cli delete <id or URL> -
 |---|---|
 | 0 | Success. |
 | 1 | Internal error in the CLI. |
-| 2 | Usage: unknown command or option, bad value, unsupported Node.js version. |
-| 3 | Local input refused: missing file, no `index.html`, a name that looks like a credential. If a file changed during the upload, the artifact may already exist (see `error.details.artifact`). |
+| 2 | Usage error or unsupported Node.js version. |
+| 3 | Local input refused. |
 | 4 | Authentication or authorization (HTTP 401 or 403). |
-| 5 | Rejected by the server (400, 413, 415, 422): too large, too many files, lifetime out of range. |
-| 6 | HTTP 429. For `rate_limited`, wait `error.details.retry_after_seconds` (short) and retry once. For `quota_exceeded`, do not wait: tell the user the daily quota resets at `error.details.resets_at`. |
-| 7 | Network or server failure. Retrying later may work. |
-| 8 | Publication failed after create. Delete the artifact from `error.details.artifact` and try again. |
+| 5 | Request rejected by the server. |
+| 6 | Rate limited or over quota (HTTP 429). |
+| 7 | Network or server failure. |
+| 8 | Publication failed after create. |
 | 9 | Not found (HTTP 404). |
 
 ## Cautions

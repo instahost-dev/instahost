@@ -2,6 +2,12 @@
 
 Changes to `@instahost/cli` and its agent skill.
 
+## 0.3.0
+
+- Every CLI failure includes a suggested fix in JSON. API errors can link to the relevant documentation. The agent skill reads the fix and uses the artifact's delete token for cleanup after a failed publication.
+- `share` and `publish` retry create with the same key to recover a lost response. If every create attempt times out, the CLI reports the failure after about two minutes. [Retrying a create](https://instahost.dev/docs/api/#retry-create)
+- A rate-limited create can wait up to 60 seconds per retry, for up to three minutes of waiting across three retries. Use `--verbose` to see the waits. If the service still refuses the request, the fix points to `details.retry_after_seconds`.
+
 ## 0.2.0
 
 - Added `publish --dry-run` to preview which files would be published or skipped, with byte counts and path warnings, without contacting InstaHost. Use `--json` to read the preview from a script or agent.

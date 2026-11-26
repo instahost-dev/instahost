@@ -45,6 +45,8 @@ describe("Node version gate (runs before the compiled CLI is imported)", () => {
     assert.equal(doc.error.code, "node_too_old");
     assert.deepEqual(doc.error.details, { required: ">=20.0.0", found: "18.20.4" });
     assert.match(doc.error.message, /Node\.js >= 20 is required \(this is 18\.20\.4\)/);
+    assert.equal(doc.error.fix, "Run the CLI with Node.js 20 or later.");
+    assert.ok(!Object.hasOwn(doc.error, "docs"));
   });
 });
 
@@ -166,14 +168,14 @@ describe("Retry-After", () => {
 
 describe("error documents", () => {
   it("redact each string value, so quotes and backslashes cannot corrupt the JSON", () => {
-    const err = new CliError("file_not_found", 'x&token=a".png does not exist', 3, { path: '/tmp/x&token=a".png', nested: [{ v: 'Bearer a"b\\c' }] });
+    const err = CliError.local("file_not_found", 'x&token=a".png does not exist', 3, { path: '/tmp/x&token=a".png', nested: [{ v: 'Bearer a"b\\c' }] });
     const doc = errorDocument(err);
     assert.equal(doc.error.code, "file_not_found");
     assert.equal(doc.error.details?.path, '/tmp/x&token=***".png');
     assert.equal(JSON.parse(JSON.stringify(doc)).error.exit_code, 3);
   });
   it("carry an artifact created before the failure, unredacted, so it can still be deleted", () => {
-    const err = new CliError("upload_failed", "x", 7, { path: "a" });
+    const err = CliError.local("upload_failed", "x", 7, { path: "a" });
     err.artifact = { id: "a".repeat(26), url: "https://f/x", delete_token: `ihd_${"T".repeat(43)}`, access_url: null };
     assert.equal((errorDocument(err).error.details?.artifact as { delete_token: string }).delete_token, `ihd_${"T".repeat(43)}`);
   });
