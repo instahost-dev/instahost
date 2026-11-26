@@ -8,7 +8,7 @@ import { copyFile, mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { ApiClient } from "../src/api-client.ts";
-import { type CreateResponse, uploadAndComplete } from "../src/upload.ts";
+import { createArtifact, uploadAndComplete } from "../src/upload.ts";
 import { type Fake, type FakeOptions, startFake } from "./fake-server.ts";
 import { PACKAGE_ROOT, fileTempDir, md5, run, tempDir, writeTree } from "./helpers.ts";
 
@@ -39,11 +39,7 @@ describe("upload URLs across several lifetimes", () => {
   }
   async function createVia(fake: Fake, files: { path: string; size: number; md5: string }[]) {
     const client = new ApiClient({ apiUrl: fake.apiUrl, sleep: async () => {} });
-    const created = await client.call<CreateResponse>("POST", "/v1/artifacts", {
-      body: { type: "site", files: files.map(({ path, size, md5: m }) => ({ path, size, md5: m })) },
-      idempotent: false,
-      phase: "create",
-    });
+    const created = await createArtifact(client, { type: "site", files: files.map(({ path, size, md5: m }) => ({ path, size, md5: m })) }, null);
     return { client, created };
   }
 
@@ -114,7 +110,11 @@ describe("failures after create keep the artifact deletable", () => {
       assert.equal(a.id, id);
       assert.equal(a.delete_token, fake.artifacts.get(id as string)?.deleteToken);
       assert.match(a.url, /notes\.txt$/);
+      const fix = "Check the network connection, then run the command again.";
+      assert.equal(r.json.error.fix, fix + " The artifact in `details.artifact` may exist: delete it with its `delete_token`.");
       const human = await run(["share", join(dir, "notes.txt"), "--api-url", fake.apiUrl]);
+      assert.ok(human.stderr.includes(`  fix:  ${fix}\n`));
+      assert.doesNotMatch(human.stderr, /details\.artifact/);
       assert.match(human.stderr, /the artifact may exist .*; delete it with: npx -y @instahost\/cli delete [a-z2-7]{26} --token ihd_/);
     });
   });
@@ -324,6 +324,9 @@ describe("the bin when the compiled CLI cannot be loaded (a damaged install)", (
       assert.equal(doc.error.exit_code, 1);
       assert.equal(doc.error.details.reason, "ERR_MODULE_NOT_FOUND");
       assert.match(doc.error.message, /reinstall/);
+      assert.match(doc.error.fix, /^Reinstall the CLI .*\.$/);
+      assert.doesNotMatch(doc.error.fix, /ih[dak]_\S+|--api-url|Idempotency-Key/);
+      assert.equal(doc.error.docs, undefined);
     } finally {
       await done();
     }

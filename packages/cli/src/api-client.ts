@@ -4,14 +4,15 @@
 //   (uploads_url, complete_url) must be on that origin too.
 // - API calls time out after 30 s. Idempotent calls (uploads, complete, delete) are retried 3
 //   times on network errors and 502/503/504 (1 s, 2 s, 4 s apart) and on 429 after Retry-After.
-//   Create is never retried automatically.
+//   Create retries with one key and body, also on 500 and on quota refusals after a lost
+//   or 5xx answer. The key stays internal to this invocation.
 import { USER_AGENT } from "./config.ts";
-import { CliError, EXIT, type Phase, exitCodeForApiError } from "./errors.ts";
+import { CliError, EXIT, type Phase } from "./errors.ts";
 import { describeUrl, redact } from "./redact.ts";
 
 export const API_TIMEOUT_MS = 30_000;
-export const RETRIES = 3;
 export const BACKOFF_SECONDS = [1, 2, 4] as const;
+export const RETRIES = BACKOFF_SECONDS.length;
 /** A Retry-After longer than this is not waited for; the 429 is reported instead. */
 export const MAX_RETRY_AFTER_SECONDS = 60;
 const RETRYABLE_STATUS = new Set([502, 503, 504]);
@@ -25,13 +26,11 @@ export interface ClientOptions {
   fetch?: typeof fetch;
 }
 
-export interface CallOptions {
+export type CallOptions = {
   body?: unknown;
   /** Bearer credential (delete token or API key); sent only to the API origin. */
   token?: string | null;
-  idempotent: boolean;
-  phase: Phase;
-}
+} & ({ phase: "create"; idempotencyKey: string } | { phase: Exclude<Phase, "create"> });
 
 export const realSleep = (seconds: number) => new Promise<void>((resolve) => setTimeout(resolve, seconds * 1000));
 
@@ -50,7 +49,35 @@ export function retryAfterSeconds(header: string | null, now = Date.now()): numb
 function failureReason(err: unknown): string {
   if (!(err instanceof Error)) return "unknown";
   if (err.name === "TimeoutError") return "timeout";
-  return (err.cause as { code?: string } | undefined)?.code ?? err.name;
+  const code = (err.cause as { code?: unknown } | undefined)?.code;
+  return typeof code === "string" ? code : err.name;
+}
+
+function createErrorGuidance(code: string): { message?: string; fix: string } | undefined {
+  switch (code) {
+    case "internal_error":
+      return { fix: "Run the command again later, and report it with the time of the request if the error persists." };
+    case "gone":
+      return {
+        message: "The artifact from the previous create attempt or its upload URLs have expired, or the artifact was deleted or blocked.",
+        fix: "Run the command again to create a new artifact.",
+      };
+    case "artifact_not_pending":
+      return {
+        message: "The artifact from the previous create attempt is already published or failed.",
+        fix: "Run the command again to create a new artifact.",
+      };
+  }
+}
+
+function errorDocs(value: unknown, apiOrigin: string): string | undefined {
+  if (typeof value !== "string") return;
+  try {
+    const url = new URL(value);
+    if (url.origin === apiOrigin && (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password) return value;
+  } catch {
+    // An invalid docs link can be omitted without losing the original error.
+  }
 }
 
 export class ApiClient {
@@ -78,7 +105,7 @@ export class ApiClient {
   resolve(pathOrUrl: string): URL {
     const url = new URL(pathOrUrl, this.apiUrl);
     if (url.origin !== this.apiUrl) {
-      throw new CliError("unsafe_url", "The API returned a URL on another origin; refusing to send credentials there.", EXIT.network, { url: describeUrl(url.href) });
+      throw CliError.local("unsafe_url", "The API returned a URL on another origin; refusing to send credentials there.", EXIT.network, { url: describeUrl(url.href) });
     }
     return url;
   }
@@ -88,56 +115,75 @@ export class ApiClient {
     const headers: Record<string, string> = { "user-agent": USER_AGENT, accept: "application/json" };
     if (options.body !== undefined) headers["content-type"] = "application/json";
     if (options.token) headers.authorization = `Bearer ${options.token}`;
+    const isCreate = options.phase === "create";
+    const key = isCreate ? options.idempotencyKey : undefined;
+    if (key) headers["idempotency-key"] = key;
     const body = options.body === undefined ? undefined : JSON.stringify(options.body);
-    const attempts = options.idempotent ? RETRIES + 1 : 1;
+    const redactKey = (value: string) => key ? value.replaceAll(key, "***") : value;
+    let ambiguousCreate = false;
 
-    for (let attempt = 1; ; attempt++) {
+    for (let attempt = 0; ; attempt++) {
+      const backoff = BACKOFF_SECONDS[attempt];
       const started = Date.now();
       let res: Response;
       let text: string;
       try {
         // The body read is guarded too: a connection cut or the timeout during the body is a
-        // network failure like any other (retried when the call is idempotent).
+        // network failure like any other.
         res = await this.#fetch(url, { method, headers, body, redirect: "error", signal: AbortSignal.timeout(API_TIMEOUT_MS) });
         text = await res.text();
       } catch (err) {
-        const reason = failureReason(err);
+        const reason = redactKey(failureReason(err));
         this.log(`api ${method} ${url.pathname} failed (${reason})`);
-        if (attempt < attempts) {
-          await this.#sleep(BACKOFF_SECONDS[attempt - 1] ?? 4);
+        if (backoff !== undefined) {
+          ambiguousCreate = isCreate;
+          await this.#sleep(backoff);
           continue;
         }
-        throw new CliError("network_error", `Could not reach the API at ${this.apiUrl}.`, EXIT.network, { reason });
+        throw CliError.local("network_error", `Could not reach the API at ${this.apiUrl}.`, EXIT.network, { reason });
       }
-      this.log(`api ${method} ${url.pathname} -> ${res.status} (${Date.now() - started} ms)`);
+      const replayed = isCreate && res.status === 201 && res.headers.get("idempotent-replayed") === "true";
+      this.log(`api ${method} ${url.pathname} -> ${res.status} (${Date.now() - started} ms)${replayed ? " (replayed)" : ""}`);
       let parsed: unknown = null;
       try {
-        parsed = text ? JSON.parse(text) : null;
+        parsed = text ? JSON.parse(res.ok ? text : redactKey(text)) : null;
       } catch {}
       if (res.ok) {
-        if (parsed === null || typeof parsed !== "object") throw new CliError("bad_response", `The API answered ${res.status} without a JSON body.`, EXIT.network, undefined, res.status);
+        if (parsed === null || typeof parsed !== "object") throw CliError.local("bad_response", `The API answered ${res.status} without a JSON body.`, EXIT.network, undefined, res.status);
         return parsed as T;
       }
-      const envelope = (parsed as { error?: { code?: unknown; message?: unknown; details?: unknown } } | null)?.error;
+      const envelope = (parsed as { error?: { code?: unknown; message?: unknown; details?: unknown; fix?: unknown; docs?: unknown } } | null)?.error;
       const code = typeof envelope?.code === "string" ? envelope.code : `http_${res.status}`;
-      if (attempt < attempts) {
-        if (RETRYABLE_STATUS.has(res.status)) {
-          await this.#sleep(BACKOFF_SECONDS[attempt - 1] ?? 4);
+      const retryAfter = retryAfterSeconds(res.headers.get("retry-after"));
+      if (backoff !== undefined) {
+        if (RETRYABLE_STATUS.has(res.status) || (isCreate && res.status === 500)) {
+          ambiguousCreate = isCreate;
+          await this.#sleep(backoff);
           continue;
         }
         if (res.status === 429 && code === "rate_limited") {
-          const wait = retryAfterSeconds(res.headers.get("retry-after")) ?? BACKOFF_SECONDS[attempt - 1] ?? 4;
+          const wait = retryAfter ?? backoff;
           if (wait <= MAX_RETRY_AFTER_SECONDS) {
             this.log(`api rate limited; retrying in ${wait} s`);
             await this.#sleep(wait);
             continue;
           }
         }
+        // The first attempt may have taken the last quota slot before its response arrived.
+        // Retry inside the replay window rather than waiting for the daily quota reset.
+        if (res.status === 429 && code === "quota_exceeded" && ambiguousCreate) {
+          await this.#sleep(backoff);
+          continue;
+        }
       }
-      const message = typeof envelope?.message === "string" ? envelope.message : `The API answered ${res.status}.`;
+      const override = isCreate ? createErrorGuidance(code) : undefined;
+      const message = override?.message ?? (typeof envelope?.message === "string" ? envelope.message : `The API answered ${res.status}.`);
+      const apiFix = envelope?.fix;
+      const fix = override?.fix ?? (typeof apiFix === "string" && apiFix.length > 0 && apiFix.length <= 500 ? apiFix : undefined);
       const details = envelope?.details && typeof envelope.details === "object" ? (envelope.details as Record<string, unknown>) : undefined;
-      const retryAfter = retryAfterSeconds(res.headers.get("retry-after"));
-      throw new CliError(code, redact(message), exitCodeForApiError(res.status, code, options.phase), retryAfter === null ? details : { ...details, retry_after_seconds: retryAfter }, res.status);
+      throw CliError.api(code, message, res.status, options.phase,
+        retryAfter === null ? details : { ...details, retry_after_seconds: retryAfter },
+        { fix, docs: errorDocs(envelope?.docs, this.apiUrl) });
     }
   }
 }

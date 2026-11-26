@@ -12,7 +12,10 @@ const dir = await fileTempDir();
 const site: Record<string, string> = { "index.html": '<link rel="stylesheet" href="css/a.css"><p>site</p>', "css/a.css": "p{color:red}", ".env": "SECRET=1" };
 for (let i = 0; i < 118; i++) site[`assets/f${String(i).padStart(3, "0")}.txt`] = `file ${i}\n`;
 await writeTree(join(dir, "site"), site);
-await writeTree(dir, { "photo.png": Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]), "notes.txt": "hello" });
+await writeTree(dir, {
+  "photo.png": Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]), "notes.txt": "hello",
+  "small-site/index.html": "<p>Small site</p>", "small-site/a.txt": "small asset",
+});
 
 async function withFake<T>(options: FakeOptions, fn: (fake: Fake) => Promise<T>): Promise<T> {
   const fake = await startFake(options);
@@ -356,7 +359,7 @@ describe("publish", () => {
     });
   });
 
-  it("retries idempotent API calls on 503 and on 429 after Retry-After, but never retries create", async () => {
+  it("still retries complete on 503 and on 429 after Retry-After", async () => {
     await withFake(
       {
         hooks: {
@@ -374,19 +377,6 @@ describe("publish", () => {
         assert.deepEqual(r.sleeps, [1, 7]);
       },
     );
-    await withFake({ hooks: { create: () => ({ status: 429, body: { error: { code: "quota_exceeded", message: "Daily quota reached.", details: { scope: "client" } } }, headers: { "retry-after": "3600" } }) } }, async (fake) => {
-      const r = await run(["share", join(dir, "notes.txt"), "--json", "--api-url", fake.apiUrl]);
-      assert.equal(r.code, 6);
-      assert.equal(r.json.error.code, "quota_exceeded");
-      assert.equal(r.json.error.details.retry_after_seconds, 3600);
-      assert.equal(apiRequests(fake, "/v1/artifacts").length, 1);
-      assert.deepEqual(r.sleeps, []);
-    });
-    await withFake({ hooks: { create: () => ({ status: 503, body: { error: { code: "service_misconfigured", message: "x" } } }) } }, async (fake) => {
-      const r = await run(["share", join(dir, "notes.txt"), "--json", "--api-url", fake.apiUrl]);
-      assert.equal(r.code, 7);
-      assert.equal(apiRequests(fake, "/v1/artifacts").length, 1);
-    });
   });
 
   it("refuses to send credentials to a complete URL on another origin, and upload URLs that are not https", async () => {
@@ -424,6 +414,212 @@ describe("publish", () => {
         await done();
       }
     });
+  });
+});
+
+describe("retrying create", () => {
+  const endpoint = "/v1/artifacts";
+  const creates = (fake: Fake) => apiRequests(fake, endpoint).filter((request) => request.path === endpoint);
+  const share = (fake: Fake) => run(["share", join(dir, "notes.txt"), "--json", "--verbose", "--api-url", fake.apiUrl]);
+  const refused = (status: number, code: string, retryAfter?: string) => ({
+    status,
+    body: { error: { code, message: "Refused." } },
+    ...(retryAfter ? { headers: { "retry-after": retryAfter } } : {}),
+  });
+
+  it("replays a stored create for share and publish with one new key per invocation", async () => {
+    await withFake({ hooks: { create: (_request, { attempt }) => attempt % 2 === 1 ? "drop-after-create" : null } }, async (fake) => {
+      const shared = await share(fake);
+      const published = await run(["publish", join(dir, "small-site"), "--json", "--verbose", "--api-url", fake.apiUrl]);
+      assert.equal(shared.code, 0, shared.stdout);
+      assert.equal(published.code, 0, published.stdout);
+      assert.equal(fake.artifacts.size, 2);
+      const requests = creates(fake);
+      assert.equal(requests.length, 4);
+      const keys = new Set<string>();
+      for (const [index, result] of [shared, published].entries()) {
+        const first = requests[index * 2];
+        const replay = requests[index * 2 + 1];
+        assert.ok(first && replay);
+        const key = first.headers["idempotency-key"];
+        assert.ok(typeof key === "string");
+        assert.match(key, /^[a-f0-9-]{36}$/);
+        assert.equal(replay.headers["idempotency-key"], key);
+        assert.deepEqual(replay.body, first.body);
+        keys.add(key);
+        assert.equal(fake.artifacts.get(result.json.id)?.status, "published");
+        assert.deepEqual(result.sleeps, [1]);
+        assert.match(result.stderr, /201 .* \(replayed\)/);
+        assert.ok(!result.stdout.includes(key) && !result.stderr.includes(key));
+      }
+      assert.equal(keys.size, 2);
+      for (const request of fake.requests.filter((r) => r.path !== endpoint)) {
+        assert.equal(request.headers["idempotency-key"], undefined);
+      }
+    });
+  });
+
+  for (const outcome of ["drop", "cut"] as const) {
+    it(`retries a create when the server cuts the connection (${outcome})`, async () => {
+      await withFake({ hooks: { create: (_request, { attempt }) => attempt === 1 ? outcome : null } }, async (fake) => {
+        const result = await share(fake);
+        assert.equal(result.code, 0, result.stdout);
+        assert.deepEqual(result.sleeps, [1]);
+        assert.equal(creates(fake).length, 2);
+        assert.equal(fake.artifacts.size, 1);
+      });
+    });
+  }
+
+  it("reports a create timeout after four attempts", async () => {
+    let attempts = 0;
+    const result = await run(["share", join(dir, "notes.txt"), "--json"], {
+      fetch: async (_url, options) => {
+        attempts++;
+        assert.ok(options?.signal);
+        throw new DOMException("test timeout", "TimeoutError");
+      },
+    });
+    assert.equal(attempts, 4);
+    assert.equal(result.code, 7);
+    assert.deepEqual(result.sleeps, [1, 2, 4]);
+    assert.equal(result.json.error.details.reason, "timeout");
+  });
+
+  for (const status of [500, 502, 503, 504]) {
+    it(`retries create on ${status} up to three times`, async () => {
+      await withFake({ hooks: { create: () => ({ status, body: "<p>Upstream unavailable</p>" }) } }, async (fake) => {
+        const result = await share(fake);
+        assert.equal(result.code, 7);
+        assert.equal(result.json.error.code, `http_${status}`);
+        assert.deepEqual(result.sleeps, [1, 2, 4]);
+        assert.equal(creates(fake).length, 4);
+      });
+    });
+  }
+
+  for (const seconds of [60, 61]) {
+    it(`honors the rate-limit wait cap with Retry-After ${seconds}`, async () => {
+      const throttled = {
+        status: 429,
+        headers: { "retry-after": String(seconds) },
+        body: { error: { code: "rate_limited", message: "Slow down.", fix: "Wait the number of seconds in `Retry-After`, then retry." } },
+      };
+      await withFake({ hooks: { create: (_request, { attempt }) => attempt === 1 ? throttled : null } }, async (fake) => {
+        const result = await share(fake);
+        if (seconds === 60) {
+          assert.equal(result.code, 0, result.stdout);
+          assert.deepEqual(result.sleeps, [60]);
+          assert.equal(creates(fake).length, 2);
+        } else {
+          assert.equal(result.code, 6);
+          assert.equal(result.json.error.details.retry_after_seconds, 61);
+          assert.equal(result.json.error.fix, "Wait the number of seconds in `details.retry_after_seconds` if set, then run the command again.");
+          assert.deepEqual(result.sleeps, []);
+          assert.equal(creates(fake).length, 1);
+        }
+      });
+    });
+  }
+
+  it("reports a quota refusal without retry when prior attempts were rate limited", async () => {
+    await withFake({ hooks: { create: (_request, { attempt }) => attempt === 1 ? refused(429, "rate_limited", "1") : refused(429, "quota_exceeded", "3600") } }, async (fake) => {
+      const result = await share(fake);
+      assert.equal(result.code, 6);
+      assert.equal(result.json.error.code, "quota_exceeded");
+      assert.equal(result.json.error.details.retry_after_seconds, 3600);
+      assert.equal(creates(fake).length, 2);
+      assert.deepEqual(result.sleeps, [1]);
+    });
+  });
+
+  for (const outcome of ["drop-after-create", "server-error"] as const) {
+    it(`retries a quota refusal after ${outcome} inside the replay window`, async () => {
+      await withFake({ hooks: { create: (_request, { attempt }) => {
+        if (attempt === 1) return outcome === "server-error" ? refused(500, "internal_error") : outcome;
+        if (attempt === 2) return refused(429, "quota_exceeded", "3600");
+        return null;
+      } } }, async (fake) => {
+        const result = await share(fake);
+        assert.equal(result.code, 0, result.stdout);
+        assert.deepEqual(result.sleeps, [1, 2]);
+        const requests = creates(fake);
+        assert.equal(requests.length, 3);
+        assert.equal(new Set(requests.map((request) => request.headers["idempotency-key"])).size, 1);
+        if (outcome === "drop-after-create") assert.match(result.stderr, /\(replayed\)/);
+        assert.equal(fake.artifacts.size, 1);
+      });
+    });
+  }
+
+  for (const [status, code] of [[409, "artifact_not_pending"], [410, "gone"]] as const) {
+    it(`keeps the last create refusal (${status}) after a lost answer`, async () => {
+      await withFake({ hooks: { create: (_request, { attempt }) => attempt === 1 ? "drop-after-create" : refused(status, code) } }, async (fake) => {
+        const result = await share(fake);
+        assert.equal(result.code, 5);
+        assert.equal(result.json.error.code, code);
+        assert.deepEqual(result.sleeps, [1]);
+        assert.equal(creates(fake).length, 2);
+        assert.equal(fake.artifacts.size, 1);
+      });
+    });
+  }
+
+  it("sends a refused create once", async () => {
+    for (const [status, code] of [[400, "invalid_request"], [429, "quota_exceeded"], [501, "http_501"]] as const) {
+      await withFake({ hooks: { create: () => refused(status, code, status === 429 ? "3600" : undefined) } }, async (fake) => {
+        const result = await share(fake);
+        assert.equal(result.json.error.code, code);
+        assert.deepEqual(result.sleeps, []);
+        assert.equal(creates(fake).length, 1);
+      });
+    }
+  });
+
+  it("reports bad_response once for successful HTTP status with invalid or incomplete JSON", async () => {
+    for (const body of ["<html>", { artifact: {} }]) {
+      await withFake({ hooks: { create: () => ({ status: 201, body }) } }, async (fake) => {
+        const result = await share(fake);
+        assert.equal(result.code, 7);
+        assert.equal(result.json.error.code, "bad_response");
+        assert.equal(creates(fake).length, 1);
+        assert.deepEqual(result.sleeps, []);
+      });
+    }
+  });
+
+  it("gets a fresh upload URL once when the replay arrives with an expired URL", async () => {
+    await withFake({ initialUrlTtlSeconds: -1, hooks: { create: (_request, { attempt }) => attempt === 1 ? "drop-after-create" : null } }, async (fake) => {
+      const result = await share(fake);
+      assert.equal(result.code, 0, result.stdout);
+      assert.match(result.stderr, /\(replayed\)/);
+      assert.equal(apiRequests(fake, "/uploads").length, 1);
+      assert.equal(fake.artifacts.size, 1);
+      assert.equal(fake.artifacts.get(result.json.id)?.status, "published");
+      assert.equal([...fake.objects.values()][0]?.toString(), "hello");
+    });
+  });
+
+  it("reports a 500 once on uploads, complete and delete", async () => {
+    const error = () => refused(500, "internal_error");
+    for (const step of ["uploads", "complete", "delete"] as const) {
+      await withFake({ batchSize: 1, hooks: { [step]: error } }, async (fake) => {
+        const options = ["--json", "--api-url", fake.apiUrl];
+        if (step === "delete") {
+          const result = await share(fake);
+          assert.equal(result.code, 0, result.stdout);
+          const deleted = await run(["delete", result.json.id, "--token", result.json.delete_token, ...options]);
+          assert.equal(deleted.code, 7);
+          assert.deepEqual(deleted.sleeps, []);
+          assert.equal(apiRequests(fake, "/v1/artifacts/", "DELETE").length, 1);
+        } else {
+          const result = await run(["publish", join(dir, "small-site"), ...options]);
+          assert.equal(result.code, 7);
+          assert.deepEqual(result.sleeps, []);
+          assert.equal(apiRequests(fake, `/${step}`).length, 1);
+        }
+      });
+    }
   });
 });
 

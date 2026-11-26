@@ -32,9 +32,8 @@ export async function deleteArtifact(ctx: CommandContext, options: { ref: string
   if (!credential) throw usageError("delete needs the artifact's delete token (--token or INSTAHOST_DELETE_TOKEN) or the owner's API key.");
   const r = await ctx.client.call<{ artifact: { id: string; status: string; deleted_at?: string } }>("DELETE", `/v1/artifacts/${id}`, {
     token: credential,
-    idempotent: true,
     phase: "delete",
   });
-  if (typeof r?.artifact?.id !== "string" || typeof r.artifact.status !== "string") throw new CliError("bad_response", "The API's answer to delete has no artifact.", EXIT.network);
+  if (typeof r?.artifact?.id !== "string" || typeof r.artifact.status !== "string") throw CliError.local("bad_response", "The API's answer to delete has no artifact.", EXIT.network);
   return { ok: true, id: r.artifact.id, status: r.artifact.status, deleted_at: r.artifact.deleted_at ?? null };
 }

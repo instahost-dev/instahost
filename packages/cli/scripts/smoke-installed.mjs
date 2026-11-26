@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Installs a packed tarball into an empty project with this Node's npm, then runs the installed
 // bin the way users do: --version, then share, publish and delete against the in-process fake API
-// and fake S3, with multi-megabyte files. Every command must exit 0 with nothing on stderr. Also
-// runs the tarball through npm exec (what npx -y does). Needs the compiled tests (build/test/).
+// and fake S3, with multi-megabyte files. Checks actionable errors and replay of a lost create.
+// Also runs the tarball through npm exec (what npx -y does). Needs the compiled tests (build/test/).
 //   node scripts/smoke-installed.mjs <instahost-cli-X.Y.Z.tgz>
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -14,7 +14,7 @@ import { delimiter, dirname, join, resolve } from "node:path";
 const tarball = process.argv[2] ? resolve(process.argv[2]) : "";
 if (!tarball || !existsSync(tarball)) throw new Error("usage: node scripts/smoke-installed.mjs <tarball>");
 const version = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
-/** @type {{ startFake: (options?: object) => Promise<{ apiUrl: string, objects: Map<string, Buffer>, requests: unknown[], stop: () => Promise<void> }> }} */
+/** @type {{ startFake: (options?: object) => Promise<{ apiUrl: string, objects: Map<string, Buffer>, artifacts: Map<string, unknown>, requests: unknown[], stop: () => Promise<void> }> }} */
 const { startFake } = await import(new URL("../build/test/fake-server.js", import.meta.url).href);
 
 const nodeBin = dirname(process.execPath);
@@ -65,7 +65,12 @@ function single(stdout) {
   }
 }
 
-const fake = await startFake();
+let loseNextCreate = false;
+const fake = await startFake({ hooks: { create: () => {
+  if (!loseNextCreate) return null;
+  loseNextCreate = false;
+  return "drop-after-create";
+} } });
 try {
   console.log(`node ${process.versions.node}, npm from ${npm}, ${tarball}`);
   const project = join(tmp, "project");
@@ -114,6 +119,20 @@ try {
 
   const usage = await exec(bin, ["publish", "site", "--name", "x", "--json"], { cwd: project });
   check("a usage error is one JSON document with exit 2", usage.code === 2 && usage.stderr === "" && single(usage.stdout)?.error?.code === "usage", JSON.stringify(usage));
+
+  const refused = await exec(bin, ["share", "report.bin", "--ttl", "never", "--json", "--api-url", fake.apiUrl], { cwd: project });
+  const error = single(refused.stdout)?.error;
+  check("a refused create includes the API fix and docs", refused.code === 4 && refused.stderr === "" &&
+    error?.fix === "Send an API key as `Authorization: Bearer ihk_…`, or drop `persistent` and set `ttl_seconds`." &&
+    error.docs === `${fake.apiUrl}/docs/api/#error-persistent_requires_api_key`, JSON.stringify(refused));
+
+  await writeFile(join(project, "replay.txt"), "create replay\n");
+  const beforeReplay = fake.artifacts.size;
+  loseNextCreate = true;
+  const replay = await exec(bin, ["share", "replay.txt", "--json", "--verbose", "--api-url", fake.apiUrl], { cwd: project });
+  check("a lost create answer replays and publishes one artifact", replay.code === 0 && single(replay.stdout)?.ok === true &&
+    replay.stderr.includes("(replayed)") && fake.artifacts.size === beforeReplay + 1 &&
+    [...fake.objects.values()].some((b) => b.toString("utf8") === "create replay\n"), JSON.stringify(replay));
 
   const npxDir = join(tmp, "npx");
   await mkdir(npxDir);

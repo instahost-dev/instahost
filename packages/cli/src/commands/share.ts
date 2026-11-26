@@ -7,7 +7,7 @@ import { basename, resolve, sep } from "node:path";
 import { CliError, EXIT, inputError } from "../errors.ts";
 import type { PublishedDocument } from "../output.ts";
 import { type Lifetime, lifetimeFields } from "../ttl.ts";
-import { type CreateResponse, afterCreate, checkCreated, uploadAndComplete } from "../upload.ts";
+import { afterCreate, createArtifact, uploadAndComplete } from "../upload.ts";
 import { sensitiveRule, validatePath } from "../vendor/paths.ts";
 import { hashFile } from "../walk.ts";
 import type { CommandContext } from "./context.ts";
@@ -54,16 +54,12 @@ export async function share(ctx: CommandContext, options: ShareOptions): Promise
   const { size, md5, dev, ino } = await hashFile(options.file, display);
   const file: Record<string, unknown> = { path: name, size, md5 };
   if (options.contentType !== undefined) file.content_type = options.contentType;
-  const created = await ctx.client.call<CreateResponse>("POST", "/v1/artifacts", {
-    body: { type: "file", access: options.access, ...lifetimeFields(options.lifetime), files: [file] },
-    token: ctx.apiKey,
-    idempotent: false,
-    phase: "create",
-  });
-  checkCreated(created);
-  if (!created.upload.files.length) throw new CliError("bad_response", "The API returned no upload URL.", EXIT.network);
-  const artifact = await afterCreate(created, () =>
-    uploadAndComplete({
+  const created = await createArtifact(ctx.client, {
+    type: "file", access: options.access, ...lifetimeFields(options.lifetime), files: [file],
+  }, ctx.apiKey);
+  const artifact = await afterCreate(created, async () => {
+    if (!created.upload.files.length) throw CliError.local("bad_response", "The API returned no upload URL.", EXIT.network);
+    return uploadAndComplete({
       client: ctx.client,
       created,
       apiKey: ctx.apiKey,
@@ -71,8 +67,8 @@ export async function share(ctx: CommandContext, options: ShareOptions): Promise
       concurrency: 1,
       onProgress: ctx.onProgress,
       fetch: ctx.fetch,
-    }),
-  );
+    });
+  });
   return {
     ok: true,
     id: artifact.id,

@@ -107,10 +107,14 @@ Without `--json`, the result goes to stdout (URL, access URL, expiry and the del
 `access_token` and `access_url` are set for private files. `delete` prints `{"ok": true, "id": "...", "status": "deleted", "deleted_at": "..."}`. Every failure prints one document:
 
 ```json
-{"ok": false, "error": {"code": "quota_exceeded", "message": "...", "details": {"scope": "client", "resets_at": "..."}, "exit_code": 6}}
+{"ok": false, "error": {"code": "persistent_requires_api_key", "message": "Persistent artifacts need an API key.",
+ "fix": "Send an API key as `Authorization: Bearer ihk_…`, or drop `persistent` and set `ttl_seconds`.",
+ "docs": "https://instahost.dev/docs/api/#error-persistent_requires_api_key", "exit_code": 4}}
 ```
 
-When a failure happens after the artifact was created, `error.details.artifact` holds `{id, url, delete_token, access_url}`, because the artifact may exist and its delete token is the only way to remove it.
+`error.fix` says what to do next. Values it refers to, such as paths or a quota reset time, appear in `error.details` when available. API errors can also include an `error.docs` link to the relevant entry. Human output shows the fix and docs link when available. [API error reference](https://instahost.dev/docs/api/#errors)
+
+When a failure happens after the artifact was created, `error.details.artifact` holds `{id, url, delete_token, access_url}`. Use the delete token to remove the artifact.
 
 ## Exit codes
 
@@ -130,7 +134,8 @@ When a failure happens after the artifact was created, `error.details.artifact` 
 ## Retries and safety
 
 - Each upload is retried up to 3 times (after 1, 2 and 4 s) on network errors, 429 and 5xx. A URL close to expiry is refreshed before use, and a 403 gets a fresh URL once per file.
-- The `/uploads` and `complete` calls and `delete` are retried on network errors, 502, 503 and 504, and on 429 `rate_limited` after `Retry-After` (up to 60 s). A 429 `quota_exceeded` is reported at once. Create is never retried, so a quota is never charged twice.
+- API calls retry up to 3 times on network errors, 502, 503 and 504, and on 429 `rate_limited` after `Retry-After` (up to 60 s).
+- `share` and `publish` send the same key and body on every attempt to create an artifact. A retry within the replay window can recover the original response. Create also retries on 500 and can retry a quota refusal after a network error or 5xx. When every request times out, a create can take about two minutes to report failure. [Retrying a create](https://instahost.dev/docs/api/#retry-create)
 - Credentials are sent only to the API origin. Upload URLs must be `https`, and the API's own follow-up URLs must be on its origin. Redirects are refused.
 
 ## Programmatic use

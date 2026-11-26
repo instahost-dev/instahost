@@ -204,6 +204,32 @@ describe("documented results", () => {
     }
   });
 
+  it("show exactly the fields of a real API failure in the README and skill", async () => {
+    const fake = await startFake();
+    const { dir, cleanup } = await tempDir();
+    try {
+      await writeTree(dir, { "a.txt": "hello" });
+      const result = await run(["share", join(dir, "a.txt"), "--ttl", "never", "--json", "--api-url", fake.apiUrl]);
+      assert.equal(result.code, 4);
+      assert.equal(result.json.error.code, "persistent_requires_api_key");
+
+      const readme = read("packages/cli/README.md");
+      const heading = readme.indexOf("\n## Output\n");
+      const output = readme.slice(heading, readme.indexOf("\n## ", heading + 1));
+      const readmeFailure = blocks(output).filter((block) => block.lang === "json")
+        .map((block) => JSON.parse(block.body)).find((example) => example.ok === false);
+      const skillFailure = /^Failure: `([^`]+)`/m.exec(read("skills/instahost/SKILL.md"))?.[1];
+      assert.ok(readmeFailure && skillFailure);
+      for (const example of [readmeFailure, JSON.parse(skillFailure)]) {
+        assert.deepEqual(Object.keys(example).sort(), Object.keys(result.json).sort());
+        assert.deepEqual(Object.keys(example.error).sort(), Object.keys(result.json.error).sort());
+      }
+    } finally {
+      await cleanup();
+      await fake.stop();
+    }
+  });
+
   for (const doc of ["packages/cli/README.md", "skills/instahost/SKILL.md"]) {
     it(`${doc} documents every exit code`, () => {
       const text = read(doc);

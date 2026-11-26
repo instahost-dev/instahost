@@ -37,18 +37,21 @@ export interface FakeArtifact {
  * Return a response to override the fake's normal answer, "drop" to cut the connection before any
  * answer, "cut" to send 200 headers and half a body and then cut it, or null to answer normally.
  */
-export type Hook = (req: RecordedRequest, ctx: { artifact?: FakeArtifact; attempt: number; path?: string }) => { status: number; body?: unknown; headers?: Record<string, string> } | "drop" | "cut" | null;
+type HookResult = { status: number; body?: unknown; headers?: Record<string, string> } | "drop" | "cut" | null;
+export type Hook<Extra = never> = (req: RecordedRequest, ctx: { artifact?: FakeArtifact; attempt: number; path?: string }) => HookResult | Extra;
 
 export interface FakeOptions {
   batchSize?: number;
   urlTtlSeconds?: number;
+  initialUrlTtlSeconds?: number;
   maxIssues?: number;
   /** Origin the API advertises for complete/uploads URLs (defaults to its own). */
   advertisedOrigin?: string;
   /** Upload URL base (defaults to the fake S3 server). */
   uploadBase?: string;
   apiKeys?: string[];
-  hooks?: { create?: Hook; uploads?: Hook; complete?: Hook; delete?: Hook; put?: Hook };
+  /** A create hook can return "drop-after-create" to store the artifact and lose its response. */
+  hooks?: { create?: Hook<"drop-after-create">; uploads?: Hook; complete?: Hook; delete?: Hook; put?: Hook };
   /** Milliseconds each PUT takes after it was accepted (a slow upload). */
   putDelayMs?: number;
   /** Include a signed content-length header in every upload instruction, as production R2 does. */
@@ -82,8 +85,6 @@ function send(res: ServerResponse, status: number, body: unknown, headers: Recor
   res.end(text);
 }
 
-const apiError = (code: string, message: string, details?: Record<string, unknown>) => ({ error: { code, message, ...(details ? { details } : {}) } });
-
 async function listen(server: Server): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -94,6 +95,7 @@ export async function startFake(options: FakeOptions = {}): Promise<Fake> {
   const urlTtl = options.urlTtlSeconds ?? 300;
   const maxIssues = options.maxIssues ?? 3;
   const hooks = options.hooks ?? {};
+  const creates = new Map<string, Record<string, unknown>>();
   const attempts = new Map<string, number>();
   const attempt = (key: string) => {
     const n = (attempts.get(key) ?? 0) + 1;
@@ -113,9 +115,8 @@ export async function startFake(options: FakeOptions = {}): Promise<Fake> {
   };
 
   const keyOf = (a: FakeArtifact, f: FakeFile) => `t/${a.id}/${a.files.indexOf(f)}`;
-  const instruction = (a: FakeArtifact, f: FakeFile) => {
-    const expires = Date.now() + urlTtl * 1000;
-    const url = `${options.uploadBase ?? fake.s3Url}/bucket/${keyOf(a, f)}?X-Amz-Expires=${urlTtl}&exp=${expires}&X-Amz-Signature=deadbeef${randomBytes(4).toString("hex")}`;
+  const instruction = (a: FakeArtifact, f: FakeFile, ttl: number, expires: number) => {
+    const url = `${options.uploadBase ?? fake.s3Url}/bucket/${keyOf(a, f)}?X-Amz-Expires=${ttl}&exp=${expires}&X-Amz-Signature=deadbeef${randomBytes(4).toString("hex")}`;
     return {
       path: f.path,
       method: "PUT",
@@ -129,7 +130,10 @@ export async function startFake(options: FakeOptions = {}): Promise<Fake> {
     };
   };
   // Millisecond precision (the real API rounds to seconds; the CLI reads both).
-  const batch = (a: FakeArtifact, files: FakeFile[]) => ({ expires_at: new Date(Date.now() + urlTtl * 1000).toISOString(), files: files.map((f) => instruction(a, f)) });
+  const batch = (a: FakeArtifact, files: FakeFile[], ttl = urlTtl) => {
+    const expires = Date.now() + ttl * 1000;
+    return { expires_at: new Date(expires).toISOString(), files: files.map((f) => instruction(a, f, ttl, expires)) };
+  };
   const view = (a: FakeArtifact) => ({
     id: a.id,
     type: a.type,
@@ -144,6 +148,9 @@ export async function startFake(options: FakeOptions = {}): Promise<Fake> {
     owner: a.ownerKey ? (a.ownerKey.split("_")[1] ?? null) : null,
   });
   const origin = () => options.advertisedOrigin ?? fake.apiUrl;
+  const apiError = (code: string, message: string, details?: Record<string, unknown>, fix = "Check the error message, then run the command again.") => ({
+    error: { code, message, ...(details ? { details } : {}), fix, docs: `${fake.apiUrl}/docs/api/#error-${code}` },
+  });
 
   const api = createServer(async (req, res) => {
     const body = await readBody(req);
@@ -154,8 +161,7 @@ export async function startFake(options: FakeOptions = {}): Promise<Fake> {
     const auth = /^Bearer (.+)$/.exec(String(req.headers.authorization ?? ""))?.[1] ?? null;
     const artifact = parts[2] ? fake.artifacts.get(parts[2]) : undefined;
     const manages = (a: FakeArtifact) => auth !== null && (auth === a.deleteToken || (a.ownerKey !== null && auth === a.ownerKey));
-    const run = (hook: Hook | undefined, name: string) => {
-      const out = hook?.(rec, { artifact, attempt: attempt(`${name}:${parts[2] ?? ""}`) });
+    const respond = (out: HookResult | undefined) => {
       if (out === "drop") {
         req.socket.destroy();
         return true;
@@ -172,13 +178,23 @@ export async function startFake(options: FakeOptions = {}): Promise<Fake> {
       }
       return false;
     };
+    const run = (hook: Hook | undefined, name: string) => respond(hook?.(rec, { artifact, attempt: attempt(`${name}:${parts[2] ?? ""}`) }));
 
     if (req.method === "POST" && url.pathname === "/v1/artifacts") {
-      if (run(hooks.create, "create")) return;
+      const hook = hooks.create?.(rec, { attempt: attempt("create:") });
+      if (hook !== "drop-after-create" && respond(hook)) return;
       if (req.headers["content-type"] !== "application/json") return send(res, 415, apiError("unsupported_media_type", "json please"));
       if (auth !== null && !(options.apiKeys ?? []).includes(auth)) return send(res, 401, apiError("invalid_api_key", "The API key is malformed, unknown or revoked."));
-      const input = JSON.parse(body.toString("utf8")) as { type: "file" | "site"; access?: string; ttl_seconds?: number; persistent?: boolean; files: FakeFile[] };
-      if (input.persistent && auth === null) return send(res, 403, apiError("persistent_requires_api_key", "Persistent artifacts need an API key."));
+      const manifest = body.toString("utf8");
+      const key = req.headers["idempotency-key"];
+      const replayKey = key ? JSON.stringify([auth, key, manifest]) : null;
+      const replay = replayKey ? creates.get(replayKey) : undefined;
+      if (replay) return send(res, 201, replay, { "idempotent-replayed": "true" });
+      const input = JSON.parse(manifest) as { type: "file" | "site"; access?: string; ttl_seconds?: number; persistent?: boolean; files: FakeFile[] };
+      if (input.persistent && auth === null) {
+        return send(res, 403, apiError("persistent_requires_api_key", "Persistent artifacts need an API key.", undefined,
+          "Send an API key as `Authorization: Bearer ihk_…`, or drop `persistent` and set `ttl_seconds`."));
+      }
       const a: FakeArtifact = {
         id: newId(),
         type: input.type,
@@ -196,13 +212,15 @@ export async function startFake(options: FakeOptions = {}): Promise<Fake> {
       const out: Record<string, unknown> = {
         artifact: view(a),
         delete_token: a.deleteToken,
-        upload: { ...batch(a, first), batch_size: batchSize, remaining: a.files.length - first.length, uploads_url: `${origin()}/v1/artifacts/${a.id}/uploads`, complete_url: `${origin()}/v1/artifacts/${a.id}/complete` },
+        upload: { ...batch(a, first, options.initialUrlTtlSeconds), batch_size: batchSize, remaining: a.files.length - first.length, uploads_url: `${origin()}/v1/artifacts/${a.id}/uploads`, complete_url: `${origin()}/v1/artifacts/${a.id}/complete` },
       };
       if (a.access === "private") {
         const at = token("iha");
         out.access_token = at;
         out.access_url = `${view(a).url}?token=${at}`;
       }
+      if (replayKey) creates.set(replayKey, out);
+      if (hook === "drop-after-create") return void req.socket.destroy();
       return send(res, 201, out);
     }
     if (!artifact) return send(res, 404, apiError("not_found", "No such artifact."));

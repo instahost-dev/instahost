@@ -3,7 +3,7 @@
 // --verbose. Human mode: the result on stdout; skipped files, warnings, errors and progress (only
 // when stderr is a TTY) on stderr. No colour is used, so NO_COLOR needs no handling.
 import type { CliError } from "./errors.ts";
-import { redact } from "./redact.ts";
+import { redact, redactCredentials } from "./redact.ts";
 import type { Skipped } from "./walk.ts";
 
 export interface Warning {
@@ -50,8 +50,10 @@ export type ResultDocument = PublishedDocument | DeletedDocument | PublishPrevie
 
 export interface ErrorDocument {
   ok: false;
-  error: { code: string; message: string; details?: Record<string, unknown>; exit_code: number };
+  error: { code: string; message: string; details?: Record<string, unknown>; fix: string; docs?: string; exit_code: number };
 }
+
+const ARTIFACT_FIX = "The artifact in `details.artifact` may exist: delete it with its `delete_token`.";
 
 export interface Streams {
   stdout: (text: string) => void;
@@ -74,7 +76,18 @@ export function redactValue(value: unknown): unknown {
 export function errorDocument(err: CliError): ErrorDocument {
   let details = err.details && Object.keys(err.details).length ? (redactValue(err.details) as Record<string, unknown>) : undefined;
   if (err.artifact) details = { ...details, artifact: { ...err.artifact } };
-  return { ok: false, error: { code: err.code, message: redact(err.message), ...(details ? { details } : {}), exit_code: err.exitCode } };
+  const fix = redactCredentials(err.fix) + (err.artifact ? ` ${ARTIFACT_FIX}` : "");
+  return {
+    ok: false,
+    error: {
+      code: err.code,
+      message: redact(err.message),
+      ...(details ? { details } : {}),
+      fix,
+      ...(err.docs ? { docs: redactCredentials(err.docs) } : {}),
+      exit_code: err.exitCode,
+    },
+  };
 }
 
 /**
@@ -136,6 +149,8 @@ export function printHumanError(streams: Streams, err: CliError): void {
     else if (p && typeof p === "object" && "path" in p) lines.push(`  ${t(String((p as { path: unknown }).path))}${"reason" in p ? `  (${t(String((p as { reason: unknown }).reason))})` : ""}`);
   }
   if (typeof details.reason === "string" && !paths.length && !err.message.includes(details.reason)) lines[0] += ` (${t(details.reason)})`;
+  lines.push(`  fix:  ${terminalSafe(redactCredentials(err.fix))}`);
+  if (err.docs) lines.push(`  docs: ${terminalSafe(redactCredentials(err.docs))}`);
   if (err.artifact) {
     const a = err.artifact;
     lines.push(`instahost: the artifact may exist (${t(a.url)}); delete it with: ${DELETE_COMMAND} ${a.id} --token ${terminalSafe(a.delete_token)}`);

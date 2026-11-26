@@ -17,7 +17,7 @@ npx -y @instahost/cli share hello.txt --ttl 1h --json
 npx -y @instahost/cli publish hello-site --ttl 1h --json
 ```
 
-Each command prints one JSON document. Open its `url`. Keep its `delete_token` to remove the artifact before it expires:
+Each command prints one JSON document. Open its `url`, or read `error.fix` if the command failed. Keep the `delete_token` to remove the artifact before it expires:
 
 ```sh
 npx -y @instahost/cli delete <id> --token <delete_token> --json

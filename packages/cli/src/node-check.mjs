@@ -28,6 +28,7 @@ export function tooOldDocument(version) {
       code: "node_too_old",
       message: `Node.js >= ${MIN_NODE[0]} is required (this is ${version}).`,
       details: { required: `>=${MIN_NODE.join(".")}.0`, found: String(version) },
+      fix: `Run the CLI with Node.js ${MIN_NODE[0]} or later.`,
       exit_code: 2,
     },
   };
