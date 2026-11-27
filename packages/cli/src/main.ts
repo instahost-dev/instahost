@@ -5,6 +5,7 @@ import { parseArgs } from "node:util";
 import { ApiClient } from "./api-client.ts";
 import { VERSION, resolveApiKey, resolveApiUrl, resolveDeleteToken } from "./config.ts";
 import { CliError, EXIT, usageError } from "./errors.ts";
+import type { CredentialSource } from "./guidance.ts";
 import { type ResultDocument, type Streams, errorDocument, printHuman, printHumanError, printJson } from "./output.ts";
 import { redact } from "./redact.ts";
 import { type Lifetime, parseTtl } from "./ttl.ts";
@@ -116,6 +117,19 @@ function choice<T extends string>(flag: string, value: string | undefined, allow
   throw usageError(`--${flag} must be one of ${allowed.join(", ")}.`);
 }
 
+/**
+ * The credential delete sends, and where it came from. Flags come before the environment:
+ * --token, then --api-key, then INSTAHOST_DELETE_TOKEN, then INSTAHOST_API_KEY.
+ */
+function deleteCredential(values: Values, env: NodeJS.ProcessEnv, apiKey: string | null, apiKeySource: CredentialSource | null): { credential: string | null; source: CredentialSource | null } {
+  const flagToken = resolveDeleteToken(values.token, {});
+  if (flagToken !== null) return { credential: flagToken, source: "--token" };
+  if (values["api-key"] !== undefined) return { credential: apiKey, source: apiKeySource };
+  const envToken = resolveDeleteToken(undefined, env);
+  if (envToken !== null) return { credential: envToken, source: "INSTAHOST_DELETE_TOKEN" };
+  return { credential: apiKey, source: apiKeySource };
+}
+
 async function run(argv: string[], deps: Required<Pick<MainDeps, "env">> & MainDeps, streams: Streams, json: boolean): Promise<ResultDocument | "help" | "version"> {
   const { command, positionals, values } = parse(argv);
   if (values.version) return "version";
@@ -130,7 +144,15 @@ async function run(argv: string[], deps: Required<Pick<MainDeps, "env">> & MainD
 
   const apiUrl = resolveApiUrl(values["api-url"], deps.env);
   const apiKey = resolveApiKey(values["api-key"], deps.env);
-  const client = new ApiClient({ apiUrl, log: values.verbose ? (line) => streams.stderr(`${line}\n`) : undefined, sleep: deps.sleep, fetch: deps.fetch });
+  const apiKeySource: CredentialSource | null = apiKey === null ? null : values["api-key"] !== undefined ? "--api-key" : "INSTAHOST_API_KEY";
+  const deletion = command === "delete" ? deleteCredential(values, deps.env, apiKey, apiKeySource) : undefined;
+  const client = new ApiClient({
+    apiUrl,
+    credentialSource: deletion ? deletion.source : apiKeySource,
+    log: values.verbose ? (line) => streams.stderr(`${line}\n`) : undefined,
+    sleep: deps.sleep,
+    fetch: deps.fetch,
+  });
   const showProgress = !json && !values.verbose && streams.stderrIsTty;
   const ctx: CommandContext = {
     client,
@@ -168,12 +190,7 @@ async function run(argv: string[], deps: Required<Pick<MainDeps, "env">> & MainD
     // A dry run has passed the same option and API key checks as a publish; it stops before any request.
     return values["dry-run"] ? previewPublish(options) : publish(ctx, options);
   }
-  if (command === "delete") {
-    // Flags before the environment: --token, then --api-key, then
-    // INSTAHOST_DELETE_TOKEN, then INSTAHOST_API_KEY.
-    const credential = resolveDeleteToken(values.token, {}) ?? (values["api-key"] !== undefined ? apiKey : null) ?? resolveDeleteToken(undefined, deps.env) ?? apiKey;
-    return deleteArtifact(ctx, { ref: target, credential });
-  }
+  if (command === "delete" && deletion) return deleteArtifact(ctx, { ref: target, credential: deletion.credential });
   throw usageError(`Unknown command ${JSON.stringify(command)}; use share, publish or delete.`);
 }
 

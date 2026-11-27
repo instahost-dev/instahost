@@ -53,7 +53,7 @@ describe("package manifest", () => {
 describe("export surface (for InstaHost's own tests; not a supported SDK)", () => {
   it("exports exactly the documented names from the package root", async () => {
     const root = await load("@instahost/cli");
-    assert.deepEqual(Object.keys(root).sort(), ["DEFAULT_API_URL", "EXIT", "HELP", "OPTIONS", "VERSION", "exitCodeForApiError", "main", "redact"]);
+    assert.deepEqual(Object.keys(root).sort(), ["DEFAULT_API_URL", "EXIT", "HELP", "OPTIONS", "RECOGNISED_API_FIXES", "VERSION", "exitCodeForApiError", "main", "redact"]);
     assert.equal(root.VERSION, manifest.version);
     assert.equal(root.DEFAULT_API_URL, "https://instahost.dev");
     assert.equal(typeof root.main, "function");

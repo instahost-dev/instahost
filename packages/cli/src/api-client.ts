@@ -6,8 +6,11 @@
 //   times on network errors and 502/503/504 (1 s, 2 s, 4 s apart) and on 429 after Retry-After.
 //   Create retries with one key and body, also on 500 and on quota refusals after a lost
 //   or 5xx answer. The key stays internal to this invocation.
+// - An error's `fix` is the API's, unless the CLI recognises the sentence and words it in CLI
+//   terms (guidance.ts).
 import { USER_AGENT } from "./config.ts";
 import { CliError, EXIT, type Phase } from "./errors.ts";
+import { type CredentialSource, cliFix } from "./guidance.ts";
 import { describeUrl, redact } from "./redact.ts";
 
 export const API_TIMEOUT_MS = 30_000;
@@ -19,6 +22,11 @@ const RETRYABLE_STATUS = new Set([502, 503, 504]);
 
 export interface ClientOptions {
   apiUrl: string;
+  /**
+   * Where the command's API key or delete token came from, or null when it has none. Create and
+   * delete send that credential; the CLI's rewrites of the API's `fix` name its source.
+   */
+  credentialSource?: CredentialSource | null;
   /** Diagnostics sink (stderr in --verbose mode); every line is redacted. */
   log?: (line: string) => void;
   /** Injected in tests so retries do not wait. */
@@ -82,12 +90,14 @@ function errorDocs(value: unknown, apiOrigin: string): string | undefined {
 
 export class ApiClient {
   readonly apiUrl: string;
+  readonly #credentialSource: CredentialSource | null;
   readonly #log: (line: string) => void;
   readonly #sleep: (seconds: number) => Promise<void>;
   readonly #fetch: typeof fetch;
 
   constructor(options: ClientOptions) {
     this.apiUrl = options.apiUrl;
+    this.#credentialSource = options.credentialSource ?? null;
     this.#log = options.log ?? (() => {});
     this.#sleep = options.sleep ?? realSleep;
     this.#fetch = options.fetch ?? fetch;
@@ -178,9 +188,14 @@ export class ApiClient {
       }
       const override = isCreate ? createErrorGuidance(code) : undefined;
       const message = override?.message ?? (typeof envelope?.message === "string" ? envelope.message : `The API answered ${res.status}.`);
-      const apiFix = envelope?.fix;
-      const fix = override?.fix ?? (typeof apiFix === "string" && apiFix.length > 0 && apiFix.length <= 500 ? apiFix : undefined);
       const details = envelope?.details && typeof envelope.details === "object" ? (envelope.details as Record<string, unknown>) : undefined;
+      const apiFix = envelope?.fix;
+      // The CLI's own wording for an API sentence it recognises (guidance.ts), else the API's. A
+      // token sent when the command has no credential of its own (the delete token that create
+      // returned) has no source the CLI can name.
+      const sent = options.token ? (this.#credentialSource ?? "unknown") : null;
+      const fix = override?.fix ?? cliFix(apiFix, options.phase, details, sent)
+        ?? (typeof apiFix === "string" && apiFix.length > 0 && apiFix.length <= 500 ? apiFix : undefined);
       throw CliError.api(code, message, res.status, options.phase,
         retryAfter === null ? details : { ...details, retry_after_seconds: retryAfter },
         { fix, docs: errorDocs(envelope?.docs, this.apiUrl) });

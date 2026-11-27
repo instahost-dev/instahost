@@ -122,8 +122,8 @@ try {
 
   const refused = await exec(bin, ["share", "report.bin", "--ttl", "never", "--json", "--api-url", fake.apiUrl], { cwd: project });
   const error = single(refused.stdout)?.error;
-  check("a refused create includes the API fix and docs", refused.code === 4 && refused.stderr === "" &&
-    error?.fix === "Send an API key as `Authorization: Bearer ihk_…`, or drop `persistent` and set `ttl_seconds`." &&
+  check("a refused create includes the fix in CLI terms and the API docs", refused.code === 4 && refused.stderr === "" &&
+    error?.fix === "Remove `--ttl never` to use the default lifetime, or keep it and pass an API key with `--api-key` or `INSTAHOST_API_KEY`." &&
     error.docs === `${fake.apiUrl}/docs/api/#error-persistent_requires_api_key`, JSON.stringify(refused));
 
   await writeFile(join(project, "replay.txt"), "create replay\n");
