@@ -108,11 +108,11 @@ Without `--json`, the result goes to stdout (URL, access URL, expiry and the del
 
 ```json
 {"ok": false, "error": {"code": "persistent_requires_api_key", "message": "Persistent artifacts need an API key.",
- "fix": "Send an API key as `Authorization: Bearer ihk_…`, or drop `persistent` and set `ttl_seconds`.",
+ "fix": "Remove `--ttl never` to use the default lifetime, or keep it and pass an API key with `--api-key` or `INSTAHOST_API_KEY`.",
  "docs": "https://instahost.dev/docs/api/#error-persistent_requires_api_key", "exit_code": 4}}
 ```
 
-`error.fix` says what to do next. Values it refers to, such as paths or a quota reset time, appear in `error.details` when available. API errors can also include an `error.docs` link to the relevant entry. Human output shows the fix and docs link when available. [API error reference](https://instahost.dev/docs/api/#errors)
+`error.fix` says what to do next. When the CLI recognises the API's advice, it rewrites it in CLI terms. It names the CLI's own options and environment variables and states values such as the longest `--ttl` or a quota reset time. For a request the API could not read, it says to try the latest CLI. Most other API advice is passed through as the API wrote it and can name HTTP fields. Values it refers to, such as paths, appear in `error.details` when available. API errors can also include an `error.docs` link to the relevant entry. Human output shows the fix and docs link when available. [API error reference](https://instahost.dev/docs/api/#errors)
 
 When a failure happens after the artifact was created, `error.details.artifact` holds `{id, url, delete_token, access_url}`. Use the delete token to remove the artifact.
 

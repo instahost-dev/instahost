@@ -17,7 +17,8 @@ export const EXIT = {
 export type ExitCode = (typeof EXIT)[keyof typeof EXIT];
 
 const REPORT_URL = "https://github.com/instahost-dev/instahost/issues";
-const UPDATE_FIX = "Try the latest CLI (`npx -y @instahost/cli@latest`), then report the error at " + REPORT_URL + " if it persists.";
+/** For an API error that means this CLI sent a request the API cannot read: a newer CLI may fix it. */
+export const UPDATE_FIX = "Try the latest CLI (`npx -y @instahost/cli@latest`), then report the error at " + REPORT_URL + " if it persists.";
 export const LOCAL_FIX = {
   usage: "Correct the command using the options listed by `npx -y @instahost/cli --help`.",
   internal_error: `Run the command again, then report the error at ${REPORT_URL} with the CLI version if it persists.`,

@@ -4,3 +4,4 @@ export { main, HELP, OPTIONS } from "./main.ts";
 export { EXIT, exitCodeForApiError } from "./errors.ts";
 export { VERSION, DEFAULT_API_URL } from "./config.ts";
 export { redact } from "./redact.ts";
+export { RECOGNISED_API_FIXES } from "./guidance.ts";

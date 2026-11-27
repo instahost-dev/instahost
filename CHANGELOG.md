@@ -2,6 +2,12 @@
 
 Changes to `@instahost/cli` and its agent skill.
 
+## 0.3.1
+
+- When the CLI recognises the API's advice, `error.fix` now names the CLI's own options and environment variables (`--ttl`, `--api-key`, `INSTAHOST_API_KEY`, `--token`, `INSTAHOST_DELETE_TOKEN` and `--content-type`) instead of HTTP headers and body fields. It also states the value to use, such as the longest `--ttl` or the time a daily quota resets. For example, `share --ttl never` without an API key says to remove `--ttl never` or pass an API key with `--api-key` or `INSTAHOST_API_KEY`.
+- Any other API `fix` is handled as in 0.3.0. So is advice whose value in `error.details` is missing or malformed. `code`, `message`, `details`, `docs` and exit codes are unchanged.
+- Errors that mean the API could not read the CLI's request, such as `invalid_json`, now say to try the latest CLI and then report the error.
+
 ## 0.3.0
 
 - Every CLI failure includes a suggested fix in JSON. API errors can link to the relevant documentation. The agent skill reads the fix and uses the artifact's delete token for cleanup after a failed publication.
