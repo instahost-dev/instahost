@@ -3,7 +3,7 @@
 // --verbose. Human mode: the result on stdout; skipped files, warnings, errors and progress (only
 // when stderr is a TTY) on stderr. No colour is used, so NO_COLOR needs no handling.
 import type { CliError } from "./errors.ts";
-import { redact, redactCredentials } from "./redact.ts";
+import { redact, redactCredentials, redactUploadCredential } from "./redact.ts";
 import type { Skipped } from "./walk.ts";
 
 export interface Warning {
@@ -65,22 +65,30 @@ export interface Streams {
 export function redactValue(value: unknown): unknown {
   if (typeof value === "string") return redact(value);
   if (Array.isArray(value)) return value.map(redactValue);
-  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactValue(v)]));
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [redactUploadCredential(k), redactValue(v)]));
   return value;
 }
 
 /**
- * The --json failure document. Details are redacted; an artifact created before the failure is
- * added afterwards, unredacted, because its delete token is the only way to remove it.
+ * The --json failure document. An artifact created before the failure keeps its usable delete
+ * token and access URL for recovery.
  */
 export function errorDocument(err: CliError): ErrorDocument {
   let details = err.details && Object.keys(err.details).length ? (redactValue(err.details) as Record<string, unknown>) : undefined;
-  if (err.artifact) details = { ...details, artifact: { ...err.artifact } };
+  if (err.artifact) {
+    const a = err.artifact;
+    details = { ...details, artifact: {
+      id: redactUploadCredential(a.id),
+      url: redactUploadCredential(a.url),
+      delete_token: redactUploadCredential(a.delete_token),
+      access_url: a.access_url === null ? null : redactUploadCredential(a.access_url),
+    } };
+  }
   const fix = redactCredentials(err.fix) + (err.artifact ? ` ${ARTIFACT_FIX}` : "");
   return {
     ok: false,
     error: {
-      code: err.code,
+      code: redactUploadCredential(err.code),
       message: redact(err.message),
       ...(details ? { details } : {}),
       fix,
@@ -153,7 +161,7 @@ export function printHumanError(streams: Streams, err: CliError): void {
   if (err.docs) lines.push(`  docs: ${terminalSafe(redactCredentials(err.docs))}`);
   if (err.artifact) {
     const a = err.artifact;
-    lines.push(`instahost: the artifact may exist (${t(a.url)}); delete it with: ${DELETE_COMMAND} ${a.id} --token ${terminalSafe(a.delete_token)}`);
+    lines.push(`instahost: the artifact may exist (${t(a.url)}); delete it with: ${DELETE_COMMAND} ${t(a.id)} --token ${terminalSafe(redactUploadCredential(a.delete_token))}`);
   }
   streams.stderr(`${lines.join("\n")}\n`);
 }

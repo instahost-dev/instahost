@@ -8,7 +8,7 @@
 //   or 5xx answer. The key stays internal to this invocation.
 // - An error's `fix` is the API's, unless the CLI recognises the sentence and words it in CLI
 //   terms (guidance.ts).
-import { USER_AGENT } from "./config.ts";
+import { USER_AGENT, isLoopbackHost } from "./config.ts";
 import { CliError, EXIT, type Phase } from "./errors.ts";
 import { type CredentialSource, cliFix } from "./guidance.ts";
 import { describeUrl, redact } from "./redact.ts";
@@ -34,11 +34,21 @@ export interface ClientOptions {
   fetch?: typeof fetch;
 }
 
-export type CallOptions = {
+type JsonCallOptions = {
   body?: unknown;
   /** Bearer credential (delete token or API key); sent only to the API origin. */
   token?: string | null;
+  upload?: never;
 } & ({ phase: "create"; idempotencyKey: string } | { phase: Exclude<Phase, "create"> });
+
+type UploadCallOptions = {
+  phase: "publish";
+  token: string;
+  body?: never;
+  upload: { open: () => Promise<Blob>; path: string; until: number };
+};
+
+export type CallOptions = JsonCallOptions | UploadCallOptions;
 
 export const realSleep = (seconds: number) => new Promise<void>((resolve) => setTimeout(resolve, seconds * 1000));
 
@@ -113,9 +123,17 @@ export class ApiClient {
 
   /** Resolves a path or an absolute URL the API returned; refuses any other origin. */
   resolve(pathOrUrl: string): URL {
-    const url = new URL(pathOrUrl, this.apiUrl);
+    let url: URL;
+    try {
+      url = new URL(pathOrUrl, this.apiUrl);
+    } catch {
+      throw CliError.local("unsafe_url", "The API returned an invalid URL.", EXIT.network);
+    }
     if (url.origin !== this.apiUrl) {
       throw CliError.local("unsafe_url", "The API returned a URL on another origin; refusing to send credentials there.", EXIT.network, { url: describeUrl(url.href) });
+    }
+    if (url.username || url.password || (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopbackHost(url.hostname)))) {
+      throw CliError.local("unsafe_url", "The API returned an unsafe URL.", EXIT.network, { url: describeUrl(url.href) });
     }
     return url;
   }
@@ -130,22 +148,32 @@ export class ApiClient {
     if (key) headers["idempotency-key"] = key;
     const body = options.body === undefined ? undefined : JSON.stringify(options.body);
     const redactKey = (value: string) => key ? value.replaceAll(key, "***") : value;
+    const upload = options.upload;
+    const uploadEnded = () => CliError.api("upload_ended", "The upload window has closed.", 410, "publish",
+      { path: upload?.path, reason: "deadline" }, {});
+    const canRetryUpload = (wait: number) => !!upload && wait <= MAX_RETRY_AFTER_SECONDS && Date.now() + wait * 1000 < upload.until;
     let ambiguousCreate = false;
 
     for (let attempt = 0; ; attempt++) {
       const backoff = BACKOFF_SECONDS[attempt];
+      if (upload && Date.now() >= upload.until) throw uploadEnded();
+      const bytes = await upload?.open();
+      if (bytes) headers["content-length"] = String(bytes.size);
       const started = Date.now();
+      const timeout = upload ? Math.min(upload.until - started, 2_147_483_647) : API_TIMEOUT_MS;
+      if (timeout <= 0) throw uploadEnded();
       let res: Response;
       let text: string;
       try {
         // The body read is guarded too: a connection cut or the timeout during the body is a
         // network failure like any other.
-        res = await this.#fetch(url, { method, headers, body, redirect: "error", signal: AbortSignal.timeout(API_TIMEOUT_MS) });
+        res = await this.#fetch(url, { method, headers, body: bytes ?? body, redirect: "error", signal: AbortSignal.timeout(timeout) });
         text = await res.text();
       } catch (err) {
         const reason = redactKey(failureReason(err));
         this.log(`api ${method} ${url.pathname} failed (${reason})`);
-        if (backoff !== undefined) {
+        if (upload && Date.now() >= upload.until) throw uploadEnded();
+        if (backoff !== undefined && (!upload || canRetryUpload(backoff))) {
           ambiguousCreate = isCreate;
           await this.#sleep(backoff);
           continue;
@@ -159,13 +187,26 @@ export class ApiClient {
         parsed = text ? JSON.parse(res.ok ? text : redactKey(text)) : null;
       } catch {}
       if (res.ok) {
+        if (upload) {
+          const state = (parsed as { state?: unknown } | null)?.state;
+          if (res.status !== 200 || (state !== "stored" && state !== "already_stored")) {
+            throw CliError.local("bad_response", "The API did not confirm the file was stored.", EXIT.network, { path: upload.path }, res.status);
+          }
+        }
         if (parsed === null || typeof parsed !== "object") throw CliError.local("bad_response", `The API answered ${res.status} without a JSON body.`, EXIT.network, undefined, res.status);
         return parsed as T;
       }
       const envelope = (parsed as { error?: { code?: unknown; message?: unknown; details?: unknown; fix?: unknown; docs?: unknown } } | null)?.error;
       const code = typeof envelope?.code === "string" ? envelope.code : `http_${res.status}`;
       const retryAfter = retryAfterSeconds(res.headers.get("retry-after"));
-      if (backoff !== undefined) {
+      if (upload && backoff !== undefined && (res.status === 429 || res.status >= 500)) {
+        const wait = retryAfter ?? backoff;
+        if (canRetryUpload(wait)) {
+          await this.#sleep(wait);
+          continue;
+        }
+      }
+      if (!upload && backoff !== undefined) {
         if (RETRYABLE_STATUS.has(res.status) || (isCreate && res.status === 500)) {
           ambiguousCreate = isCreate;
           await this.#sleep(backoff);
@@ -188,7 +229,8 @@ export class ApiClient {
       }
       const override = isCreate ? createErrorGuidance(code) : undefined;
       const message = override?.message ?? (typeof envelope?.message === "string" ? envelope.message : `The API answered ${res.status}.`);
-      const details = envelope?.details && typeof envelope.details === "object" ? (envelope.details as Record<string, unknown>) : undefined;
+      const errorDetails = envelope?.details && typeof envelope.details === "object" ? (envelope.details as Record<string, unknown>) : undefined;
+      const details = upload ? { ...errorDetails, path: upload.path } : errorDetails;
       const apiFix = envelope?.fix;
       // The CLI's own wording for an API sentence it recognises (guidance.ts), else the API's. A
       // token sent when the command has no credential of its own (the delete token that create

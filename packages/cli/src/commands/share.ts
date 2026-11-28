@@ -58,7 +58,9 @@ export async function share(ctx: CommandContext, options: ShareOptions): Promise
     type: "file", access: options.access, ...lifetimeFields(options.lifetime), files: [file],
   }, ctx.apiKey);
   const artifact = await afterCreate(created, async () => {
-    if (!created.upload.files.length) throw CliError.local("bad_response", "The API returned no upload URL.", EXIT.network);
+    if (created.upload.protocol !== "gateway-v1" && !created.upload.files.length) {
+      throw CliError.local("bad_response", "The API returned no upload URL.", EXIT.network);
+    }
     return uploadAndComplete({
       client: ctx.client,
       created,

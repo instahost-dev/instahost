@@ -1,4 +1,6 @@
 // Uploads and publication.
+// - Gateway uploads use the API origin and a dedicated bearer credential. PUTs use manifest
+//   indices and can be repeated after a lost response until the upload window closes.
 // - One presigned PUT per file, body streamed from disk (fs.openAsBlob), signed headers replayed
 //   exactly. A returned content-length header is checked against the file, not sent explicitly.
 // - Batches of upload URLs are requested through /uploads just before use; `concurrency` PUTs run
@@ -62,7 +64,24 @@ export interface CreateResponse {
   delete_token: string;
   access_token?: string;
   access_url?: string;
-  upload: InstructionBatch & { batch_size: number; remaining: number; uploads_url: string; complete_url: string };
+  upload: PresignedUpload | GatewayUpload;
+}
+
+interface PresignedUpload extends InstructionBatch {
+  protocol?: "legacy";
+  batch_size: number;
+  remaining: number;
+  uploads_url: string;
+  complete_url: string;
+}
+
+interface GatewayUpload {
+  protocol: "gateway-v1";
+  credential: string;
+  upload_until: string;
+  data_base_url: string;
+  status_url: string;
+  complete_url: string;
 }
 
 export interface PublishSession {
@@ -117,6 +136,7 @@ export function checkUploadUrl(raw: string, apiUrl: string): URL {
   }
   const api = new URL(apiUrl);
   const localHttp = url.protocol === "http:" && isLoopbackHost(url.hostname) && api.protocol === "http:" && isLoopbackHost(api.hostname);
+  if (url.username || url.password) throw CliError.local("unsafe_url", "The API returned an upload URL with credentials.", EXIT.network);
   if (url.protocol !== "https:" && !localHttp) {
     throw CliError.local("unsafe_url", "The API returned an upload URL that is not https.", EXIT.network, { url: describeUrl(raw) });
   }
@@ -137,16 +157,21 @@ export function checkBatch(batch: unknown, where: string): asserts batch is Inst
 /** The fields read from a create answer (batch_size must be at least 1, or batching never ends). */
 export function checkCreated(created: unknown): asserts created is CreateResponse {
   const c = created as Partial<CreateResponse> | null | undefined;
-  checkBatch(c?.upload, "create");
-  const u = c?.upload as CreateResponse["upload"];
-  const ok =
-    typeof c?.artifact?.id === "string" &&
-    typeof c.delete_token === "string" &&
-    Number.isInteger(u.batch_size) &&
-    u.batch_size >= 1 &&
-    typeof u.uploads_url === "string" &&
-    typeof u.complete_url === "string";
-  if (!ok) throw CliError.local("bad_response", "The API's answer to create is incomplete.", EXIT.network);
+  const invalid = () => CliError.local("bad_response", "The API's answer to create is incomplete.", EXIT.network);
+  const upload = c?.upload;
+  if (typeof c?.artifact?.id !== "string" || typeof c.delete_token !== "string" || typeof upload?.complete_url !== "string") {
+    throw invalid();
+  }
+  if (upload.protocol === "gateway-v1") {
+    if (typeof upload.credential !== "string" || !/^ihu_[A-Za-z0-9_-]{43}$/.test(upload.credential)
+      || typeof upload.upload_until !== "string" || !Number.isFinite(Date.parse(upload.upload_until))
+      || typeof upload.data_base_url !== "string" || !upload.data_base_url || typeof upload.status_url !== "string" || !upload.status_url
+      || !upload.complete_url) throw invalid();
+    return;
+  }
+  checkBatch(upload, "create");
+  if ((upload.protocol !== undefined && upload.protocol !== "legacy") || !Number.isInteger(upload.batch_size)
+    || upload.batch_size < 1 || typeof upload.uploads_url !== "string") throw invalid();
 }
 
 /** Give each invocation one create key for the original request and any retries. */
@@ -162,8 +187,39 @@ export function checkArtifact(artifact: unknown, where: string): asserts artifac
   if (!a || typeof a.id !== "string" || typeof a.url !== "string") throw CliError.local("bad_response", `The API's answer to ${where} has no artifact.`, EXIT.network);
 }
 
-class Uploader {
+/** The file's bytes, from the same file that was hashed: never through a symlink swapped in since. */
+async function fileBody(file: UploadFile): Promise<Blob> {
+  const changed = () => inputError("file_changed", `${file.path} changed since it was hashed; try again.`, { path: file.path });
+  const unreadable = () => inputError("unreadable_file", `${file.path} can no longer be read.`, { path: file.path });
+  const info = await lstat(file.absPath).catch(() => { throw unreadable(); });
+  if (!info.isFile() || info.size !== file.size || (file.ino !== undefined && (info.ino !== file.ino || info.dev !== file.dev))) throw changed();
+  const body = await openAsBlob(file.absPath).catch(() => { throw unreadable(); });
+  if (body.size !== file.size) throw changed();
+  return body;
+}
+
+async function uploadPool<T>(items: T[], concurrency: number, upload: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  let stopped = false;
+  const worker = async () => {
+    while (next < items.length && !stopped) {
+      try {
+        await upload(items[next++] as T);
+      } catch (err) {
+        stopped = true; // the other workers finish their current file and stop
+        throw err;
+      }
+    }
+  };
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, worker);
+  const results = await Promise.allSettled(workers);
+  const failed = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+  if (failed) throw failed.reason;
+}
+
+class PresignedUploader {
   readonly #s: PublishSession;
+  readonly #upload: PresignedUpload;
   readonly #fetch: typeof fetch;
   readonly #minLifeMs: number;
   readonly #cache = new Map<string, Cached>();
@@ -174,11 +230,12 @@ class Uploader {
   #round: Promise<void> | null = null;
   #progress = 0;
 
-  constructor(session: PublishSession) {
+  constructor(session: PublishSession, upload: PresignedUpload) {
     this.#s = session;
+    this.#upload = upload;
     this.#fetch = session.fetch ?? fetch;
     this.#minLifeMs = session.minUrlLifeMs ?? MIN_URL_LIFE_MS;
-    this.remember(session.created.upload);
+    this.remember(upload);
   }
 
   remember(batch: InstructionBatch): void {
@@ -205,9 +262,9 @@ class Uploader {
   }
 
   async issue(paths: string[]): Promise<void> {
-    const size = this.#s.created.upload.batch_size;
+    const size = this.#upload.batch_size;
     for (let i = 0; i < paths.length; i += size) {
-      const r = await this.#s.client.call<{ upload: InstructionBatch }>("POST", this.#s.created.upload.uploads_url, {
+      const r = await this.#s.client.call<{ upload: InstructionBatch }>("POST", this.#upload.uploads_url, {
         body: { paths: paths.slice(i, i + size) },
         token: this.#token,
         phase: "publish",
@@ -245,51 +302,14 @@ class Uploader {
   }
 
   async uploadAll(files: UploadFile[]): Promise<void> {
-    const size = this.#s.created.upload.batch_size;
+    const size = this.#upload.batch_size;
     for (let i = 0; i < files.length; i += size) {
       const batch = files.slice(i, i + size);
       const now = Date.now();
       const stale = batch.filter((f) => this.#stale(f.path, now)).map((f) => f.path);
       if (stale.length) await this.issue(stale);
-      await this.#pool(batch);
+      await uploadPool(batch, this.#s.concurrency, (file) => this.#uploadOne(file, batch));
     }
-  }
-
-  async #pool(batch: UploadFile[]): Promise<void> {
-    let next = 0;
-    let stopped = false;
-    const worker = async () => {
-      while (next < batch.length && !stopped) {
-        const file = batch[next++] as UploadFile;
-        try {
-          await this.#uploadOne(file, batch);
-        } catch (err) {
-          stopped = true; // the other workers finish their current file and stop
-          throw err;
-        }
-      }
-    };
-    const workers = Array.from({ length: Math.min(this.#s.concurrency, batch.length) }, worker);
-    const results = await Promise.allSettled(workers);
-    const failed = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
-    if (failed) throw failed.reason;
-  }
-
-  /** The file's bytes, from the same file that was hashed: never through a symlink swapped in since. */
-  async #body(file: UploadFile): Promise<Blob> {
-    const changed = () => inputError("file_changed", `${file.path} changed since it was hashed; try again.`, { path: file.path });
-    let info;
-    try {
-      info = await lstat(file.absPath);
-    } catch {
-      throw inputError("unreadable_file", `${file.path} can no longer be read.`, { path: file.path });
-    }
-    if (!info.isFile() || info.size !== file.size || (file.ino !== undefined && (info.ino !== file.ino || info.dev !== file.dev))) throw changed();
-    const body = await openAsBlob(file.absPath).catch(() => {
-      throw inputError("unreadable_file", `${file.path} can no longer be read.`, { path: file.path });
-    });
-    if (body.size !== file.size) throw changed();
-    return body;
   }
 
   async #uploadOne(file: UploadFile, batch: UploadFile[]): Promise<void> {
@@ -310,13 +330,15 @@ class Uploader {
       const url = checkUploadUrl(instruction.url, this.#s.client.apiUrl);
       const headers: Record<string, string> = {};
       for (const [name, value] of Object.entries(instruction.headers)) {
-        if (name.toLowerCase() === "content-length") {
+        const lower = name.toLowerCase();
+        if (lower === "authorization") continue;
+        if (lower === "content-length") {
           if (Number(value) !== file.size) throw inputError("file_changed", `${file.path} changed size since it was hashed; try again.`, { path: file.path });
           continue; // fetch sends the length of the body itself
         }
         headers[name] = value;
       }
-      const body = await this.#body(file);
+      const body = await fileBody(file);
 
       let status: number;
       let detail: string | null = null;
@@ -363,6 +385,46 @@ class Uploader {
   }
 }
 
+class GatewayUploader {
+  readonly #session: PublishSession;
+  readonly #upload: GatewayUpload;
+  readonly #dataBase: URL;
+  readonly #until: number;
+  readonly #indexByPath: Map<string, number>;
+  #progress = 0;
+
+  constructor(session: PublishSession, upload: GatewayUpload) {
+    this.#session = session;
+    this.#upload = upload;
+    this.#dataBase = session.client.resolve(upload.data_base_url);
+    session.client.resolve(upload.status_url);
+    session.client.resolve(upload.complete_url);
+    this.#until = Date.parse(upload.upload_until);
+    this.#indexByPath = new Map(session.files.map((file, index) => [file.path, index]));
+  }
+
+  async uploadAll(files: UploadFile[]): Promise<void> {
+    const { client, concurrency, onProgress } = this.#session;
+    await uploadPool(files, concurrency, async (file) => {
+      const url = new URL(this.#dataBase);
+      url.pathname = `${url.pathname.replace(/\/$/, "")}/${this.#indexByPath.get(file.path)}`;
+      await client.call("PUT", url.href, {
+        phase: "publish",
+        token: this.#upload.credential,
+        upload: { open: () => fileBody(file), path: file.path, until: this.#until },
+      });
+      onProgress?.(++this.#progress, this.#session.files.length);
+    });
+  }
+
+  async reupload(paths: string[]): Promise<void> {
+    const wanted = new Set(paths);
+    const files = this.#session.files.filter((file) => wanted.has(file.path));
+    this.#progress = Math.max(0, this.#progress - files.length);
+    await this.uploadAll(files);
+  }
+}
+
 /**
  * Runs the steps after create; any failure carries the created artifact's id, URL and delete token,
  * because the artifact may exist (an answer can be lost after the server published it).
@@ -384,11 +446,13 @@ export function manageToken(session: Pick<PublishSession, "apiKey" | "created">)
 
 /** Uploads every file and publishes the artifact; returns the published artifact. */
 export async function uploadAndComplete(session: PublishSession): Promise<AuthorizedArtifact> {
-  const uploader = new Uploader(session);
+  const upload = session.created.upload;
+  const gateway = upload.protocol === "gateway-v1";
+  const uploader = gateway ? new GatewayUploader(session, upload) : new PresignedUploader(session, upload);
   await uploader.uploadAll(session.files);
   for (let call = 1; ; call++) {
     try {
-      const r = await session.client.call<{ artifact: AuthorizedArtifact }>("POST", session.created.upload.complete_url, {
+      const r = await session.client.call<{ artifact: AuthorizedArtifact }>("POST", upload.complete_url, {
         token: manageToken(session),
         phase: "publish",
       });
@@ -397,8 +461,11 @@ export async function uploadAndComplete(session: PublishSession): Promise<Author
     } catch (err) {
       if (!(err instanceof CliError) || err.code !== "upload_incomplete" || call >= MAX_COMPLETE_CALLS) throw err;
       const missing = Array.isArray(err.details?.missing) ? (err.details.missing as unknown[]).filter((p): p is string => typeof p === "string") : [];
-      session.client.log(`complete: ${String(err.details?.missing_count ?? missing.length)} file(s) missing; uploading them again`);
-      await uploader.reupload(missing.length ? missing : session.files.map((f) => f.path));
+      const count = err.details?.missing_count;
+      session.client.log(`complete: ${String(count ?? missing.length)} file(s) missing; uploading them again`);
+      // The list is capped at 100 paths. Indexed PUTs can safely cover any omitted paths.
+      const truncated = gateway && typeof count === "number" && count > missing.length;
+      await uploader.reupload(missing.length && !truncated ? missing : session.files.map((f) => f.path));
     }
   }
 }

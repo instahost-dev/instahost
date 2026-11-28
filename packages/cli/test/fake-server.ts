@@ -31,6 +31,7 @@ export interface FakeArtifact {
   files: FakeFile[];
   completeCalls: number;
   expiresAt: string | null;
+  gateway: { credential: string; until: number } | null;
 }
 
 /**
@@ -50,8 +51,9 @@ export interface FakeOptions {
   /** Upload URL base (defaults to the fake S3 server). */
   uploadBase?: string;
   apiKeys?: string[];
+  gateway?: { force?: boolean; ttlSeconds?: number; dataOrigin?: string; statusOrigin?: string };
   /** A create hook can return "drop-after-create" to store the artifact and lose its response. */
-  hooks?: { create?: Hook<"drop-after-create">; uploads?: Hook; complete?: Hook; delete?: Hook; put?: Hook };
+  hooks?: { create?: Hook<"drop-after-create">; uploads?: Hook; complete?: Hook; delete?: Hook; put?: Hook; gatewayPut?: Hook<"drop-after-put"> };
   /** Milliseconds each PUT takes after it was accepted (a slow upload). */
   putDelayMs?: number;
   /** Include a signed content-length header in every upload instruction, as production R2 does. */
@@ -195,6 +197,7 @@ export async function startFake(options: FakeOptions = {}): Promise<Fake> {
         return send(res, 403, apiError("persistent_requires_api_key", "Persistent artifacts need an API key.", undefined,
           "Send an API key as `Authorization: Bearer ihk_…`, or drop `persistent` and set `ttl_seconds`."));
       }
+      const gateway = options.gateway?.force ? { credential: token("ihu"), until: Date.now() + (options.gateway.ttlSeconds ?? 900) * 1000 } : null;
       const a: FakeArtifact = {
         id: newId(),
         type: input.type,
@@ -205,15 +208,28 @@ export async function startFake(options: FakeOptions = {}): Promise<Fake> {
         files: input.files.map((f) => ({ ...f, issued: 0 })),
         completeCalls: 0,
         expiresAt: input.persistent ? null : "2026-11-22T00:00:00Z",
+        gateway,
       };
       fake.artifacts.set(a.id, a);
-      const first = a.files.slice(0, batchSize);
-      for (const f of first) f.issued++;
+      const completeUrl = `${origin()}/v1/artifacts/${a.id}/complete`;
       const out: Record<string, unknown> = {
         artifact: view(a),
         delete_token: a.deleteToken,
-        upload: { ...batch(a, first, options.initialUrlTtlSeconds), batch_size: batchSize, remaining: a.files.length - first.length, uploads_url: `${origin()}/v1/artifacts/${a.id}/uploads`, complete_url: `${origin()}/v1/artifacts/${a.id}/complete` },
       };
+      if (gateway) {
+        out.upload = {
+          protocol: "gateway-v1",
+          credential: gateway.credential,
+          upload_until: new Date(gateway.until).toISOString(),
+          data_base_url: `${options.gateway?.dataOrigin ?? fake.apiUrl}/v1/upload-gateway/${a.id}/files`,
+          status_url: `${options.gateway?.statusOrigin ?? fake.apiUrl}/v1/upload-gateway/${a.id}/status`,
+          complete_url: completeUrl,
+        };
+      } else {
+        const first = a.files.slice(0, batchSize);
+        for (const f of first) f.issued++;
+        out.upload = { ...batch(a, first, options.initialUrlTtlSeconds), batch_size: batchSize, remaining: a.files.length - first.length, uploads_url: `${origin()}/v1/artifacts/${a.id}/uploads`, complete_url: completeUrl };
+      }
       if (a.access === "private") {
         const at = token("iha");
         out.access_token = at;
@@ -224,9 +240,36 @@ export async function startFake(options: FakeOptions = {}): Promise<Fake> {
       return send(res, 201, out);
     }
     if (!artifact) return send(res, 404, apiError("not_found", "No such artifact."));
+    if (req.method === "PUT" && parts[1] === "upload-gateway" && parts[3] === "files") {
+      const gateway = artifact.gateway;
+      if (!gateway || auth !== gateway.credential) return send(res, 403, apiError("forbidden", "An upload credential is required."));
+      if (Date.now() >= gateway.until || artifact.status !== "pending") return send(res, 410, apiError("upload_ended", "The upload window has closed."));
+      const file = artifact.files[Number(parts[4])];
+      if (!file) return send(res, 404, apiError("not_found", "No such manifest index."));
+      const key = keyOf(artifact, file);
+      inFlight++;
+      fake.maxConcurrentPuts = Math.max(fake.maxConcurrentPuts, inFlight);
+      try {
+        await new Promise((r) => setTimeout(r, options.putDelayMs ?? 5));
+        const hook = hooks.gatewayPut?.(rec, { artifact, path: file.path, attempt: attempt(`gatewayPut:${key}`) });
+        if (hook !== "drop-after-put" && respond(hook)) return;
+        if (req.headers["content-length"] !== String(file.size) || body.length !== file.size) {
+          return send(res, 400, apiError("upload_length_mismatch", "The declared length differs from the manifest."));
+        }
+        if (req.headers["content-encoding"] !== undefined) return send(res, 415, apiError("content_encoding_unsupported", "Send the original bytes."));
+        if (createHash("md5").update(body).digest("hex") !== file.md5) return send(res, 422, apiError("checksum_mismatch", "The bytes differ from the manifest."));
+        const stored = fake.objects.has(key);
+        if (!stored) fake.objects.set(key, body);
+        if (hook === "drop-after-put") return void req.socket.destroy();
+        return send(res, 200, { state: stored ? "already_stored" : "stored" });
+      } finally {
+        inFlight--;
+      }
+    }
     if (!manages(artifact)) return send(res, auth ? 403 : 401, apiError(auth ? "forbidden" : "unauthorized", "This credential cannot manage this artifact."));
 
     if (req.method === "POST" && parts[3] === "uploads") {
+      if (artifact.gateway) return send(res, 409, apiError("upload_protocol_unavailable", "This artifact uses the gateway."));
       if (run(hooks.uploads, "uploads")) return;
       if (artifact.status !== "pending") return send(res, 409, apiError("artifact_not_pending", "not pending"));
       const { paths } = JSON.parse(body.toString("utf8")) as { paths: string[] };
