@@ -52,8 +52,7 @@ export async function share(ctx: CommandContext, options: ShareOptions): Promise
   refuseSensitive(display, real.split(sep).filter(Boolean).join("/"));
 
   const { size, md5, dev, ino } = await hashFile(options.file, display);
-  const file: Record<string, unknown> = { path: name, size, md5 };
-  if (options.contentType !== undefined) file.content_type = options.contentType;
+  const file = { path: name, size, md5, content_type: options.contentType };
   const created = await createArtifact(ctx.client, {
     type: "file", access: options.access, ...lifetimeFields(options.lifetime), files: [file],
   }, ctx.apiKey);

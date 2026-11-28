@@ -474,7 +474,8 @@ describe("retrying create", () => {
   it("reports a create timeout after four attempts", async () => {
     let attempts = 0;
     const result = await run(["share", join(dir, "notes.txt"), "--json"], {
-      fetch: async (_url, options) => {
+      fetch: async (url, options) => {
+        if (String(url).endsWith("/v1/limits")) return Response.json({});
         attempts++;
         assert.ok(options?.signal);
         throw new DOMException("test timeout", "TimeoutError");

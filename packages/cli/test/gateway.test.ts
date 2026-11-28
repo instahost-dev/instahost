@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
+import { truncate } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { type Fake, type FakeOptions, startFake } from "./fake-server.ts";
@@ -31,6 +32,14 @@ const creates = (fake: Fake) => fake.requests.filter((req) => req.method === "PO
 function assertGatewayOnly(fake: Fake): void {
   assert.equal(fake.artifacts.size, 1);
   assert.equal(fake.requests.some((req) => req.server === "s3" || req.path.endsWith("/uploads")), false);
+}
+
+function assertPresignedOnly(fake: Fake): void {
+  assert.equal(fake.artifacts.size, 1);
+  assert.equal(gatewayPuts(fake).length, 0);
+  const puts = fake.requests.filter((req) => req.server === "s3" && req.method === "PUT");
+  assert.equal(puts.length, [...fake.artifacts.values()][0]!.files.length);
+  for (const put of puts) assert.equal(put.headers.authorization, undefined);
 }
 
 describe("gateway upload instructions", () => {
@@ -188,7 +197,7 @@ describe("gateway upload instructions", () => {
         const result = await run(["share", notes, ...flags(fake)]);
         assert.deepEqual([result.code, result.json.error.code], [7, "unsafe_url"]);
         assertGatewayOnly(fake);
-        assert.deepEqual(fake.requests.map((req) => req.method), ["POST"]);
+        assert.deepEqual(fake.requests.map((req) => req.method), ["GET", "POST"]);
       });
     }
   });
@@ -204,6 +213,148 @@ describe("gateway upload instructions", () => {
         const result = await run(["share", notes, ...flags(fake)]);
         assert.deepEqual([result.code, result.json.error.code], [7, "network_error"]);
         assertGatewayOnly(fake);
+      });
+    }
+  });
+});
+
+const LIMIT = 104_857_600;
+const gateway = { limits: { anonymous: true, api_key: true, single_request_max_bytes: LIMIT }, admission: "all" } as const;
+const ACCOUNT_KEY = `ihk_abcdefghijkm_${"A".repeat(43)}`;
+const createBodies = (fake: Fake) => creates(fake).map((req) => JSON.parse(req.body.toString()));
+const createProtocols = (fake: Fake) => createBodies(fake).map((body) => body.upload_protocol);
+const apiError = (status: number, code: string) => ({ status, body: { error: { code } } });
+
+describe("choosing a protocol for create", () => {
+  it("selects the gateway for keyless share and operator-key publish using public limits", async () => {
+    for (const [command, path, key] of [["share", notes, null], ["publish", site, OPERATOR_KEY]] as const) {
+      await withFake({ gateway, apiKeys: [OPERATOR_KEY] }, async (fake) => {
+        const result = await run([command, path, ...flags(fake), ...(key ? ["--api-key", key] : [])]);
+        assert.equal(result.code, 0, result.stdout);
+        assertGatewayOnly(fake);
+        assert.deepEqual(createProtocols(fake), ["gateway-v1"]);
+        const [limits] = fake.requests;
+        assert.deepEqual([limits?.method, limits?.path, limits?.headers.authorization], ["GET", "/v1/limits", undefined]);
+        assert.equal(gatewayPuts(fake).length, result.json.file_count);
+      });
+    }
+  });
+
+  it("uses the per-file limit for a mixed-size site, including the exact cap and one byte over", async () => {
+    const largeSite = join(dir, "large-site");
+    await writeTree(largeSite, { "index.html": "<p>large site</p>", "asset.bin": "" });
+    for (const size of [LIMIT, LIMIT + 1]) {
+      await truncate(join(largeSite, "asset.bin"), size);
+      await withFake({ gateway }, async (fake) => {
+        const result = await run(["publish", largeSite, ...flags(fake)]);
+        assert.equal(result.code, 0, result.stdout);
+        assert.ok(result.json.total_bytes > LIMIT);
+        assert.equal(createBodies(fake)[0].files.find((file: { path: string }) => file.path === "asset.bin").size, size);
+        assert.deepEqual(createProtocols(fake), [size === LIMIT ? "gateway-v1" : undefined]);
+        if (size === LIMIT) {
+          assertGatewayOnly(fake);
+          assert.ok(gatewayPuts(fake).some((put) => put.body.length === LIMIT));
+        } else {
+          assertPresignedOnly(fake);
+        }
+      });
+    }
+  });
+
+  it("uses legacy when discovery is missing, unavailable or disabled for the caller", async () => {
+    for (const options of [
+      {},
+      { hooks: { limits: () => apiError(404, "not_found") } },
+      { hooks: { limits: () => apiError(503, "service_unavailable") } },
+      { gateway: { ...gateway, limits: { ...gateway.limits, anonymous: false } } },
+    ]) {
+      await withFake(options, async (fake) => {
+        const result = await run(["share", notes, ...flags(fake)]);
+        assert.equal(result.code, 0, result.stdout);
+        assert.deepEqual(result.sleeps, []);
+        assertPresignedOnly(fake);
+        assert.deepEqual(createProtocols(fake), [undefined]);
+      });
+    }
+    await withFake({ gateway: { ...gateway, limits: { ...gateway.limits, api_key: false } }, apiKeys: [OPERATOR_KEY] }, async (fake) => {
+      const result = await run(["share", notes, "--api-key", OPERATOR_KEY, ...flags(fake)]);
+      assert.equal(result.code, 0, result.stdout);
+      assertPresignedOnly(fake);
+      assert.deepEqual(createProtocols(fake), [undefined]);
+    });
+  });
+
+  it("falls back once on a definite pre-create protocol refusal, preserving auth and the manifest", async () => {
+    const cases: { options: FakeOptions; key?: string }[] = [
+      { options: { gateway: { ...gateway, accountKeys: [ACCOUNT_KEY] } }, key: ACCOUNT_KEY },
+      { options: { gateway: { ...gateway, admission: "off" } } },
+      ...([[400, "upload_protocol_unsupported"], [413, "gateway_file_too_large"]] as const).map(([status, code]): { options: FakeOptions } => ({
+        options: { gateway, hooks: { create: (_req, { attempt }) => attempt === 1 ? apiError(status, code) : null } },
+      })),
+    ];
+    for (const { options, key } of cases) {
+      await withFake(options, async (fake) => {
+        const result = await run(["publish", site, ...flags(fake), ...(key ? ["--api-key", key] : [])]);
+        assert.equal(result.code, 0, result.stdout);
+        assertPresignedOnly(fake);
+        assert.deepEqual(createProtocols(fake), ["gateway-v1", undefined]);
+        const [{ upload_protocol: _, ...first }, second] = createBodies(fake);
+        assert.deepEqual(first, second);
+        const requests = creates(fake);
+        assert.deepEqual(requests.map((req) => req.headers.authorization), Array(2).fill(key ? `Bearer ${key}` : undefined));
+        assert.equal(new Set(requests.map((req) => req.headers["idempotency-key"])).size, 2);
+      });
+    }
+  });
+
+  it("replays a lost gateway create with identical bytes and idempotency key", async () => {
+    await withFake({
+      gateway,
+      hooks: { create: (_req, { attempt }) => attempt === 1 ? "drop-after-create" : null },
+    }, async (fake) => {
+      const result = await run(["share", notes, ...flags(fake)]);
+      assert.equal(result.code, 0, result.stdout);
+      assertGatewayOnly(fake);
+      assert.deepEqual(createProtocols(fake), ["gateway-v1", "gateway-v1"]);
+      assert.deepEqual(result.sleeps, [1]);
+      const [first, second] = creates(fake);
+      assert.ok(first?.headers["idempotency-key"]);
+      assert.equal(first.headers["idempotency-key"], second?.headers["idempotency-key"]);
+      assert.deepEqual(first.body, second?.body);
+      assert.equal(completeCalls(fake).length, 1);
+    });
+  });
+
+  it("keeps the original protocol if a create refusal follows a lost or 5xx response", async () => {
+    for (const firstReply of ["drop-after-create", apiError(503, "service_unavailable")] as const) {
+      await withFake({
+        gateway,
+        hooks: { create: (_req, { attempt }) => attempt === 1 ? firstReply : apiError(409, "upload_protocol_unavailable") },
+      }, async (fake) => {
+        const result = await run(["share", notes, ...flags(fake)]);
+        assert.deepEqual([result.code, result.json.error.code], [5, "upload_protocol_unavailable"]);
+        assert.deepEqual(createProtocols(fake), ["gateway-v1", "gateway-v1"]);
+        assert.equal(new Set(creates(fake).map((req) => req.headers["idempotency-key"])).size, 1);
+        assert.equal(fake.artifacts.size, firstReply === "drop-after-create" ? 1 : 0);
+        assert.equal(fake.requests.some((req) => req.method === "PUT"), false);
+      });
+    }
+  });
+
+  it("stops on auth or quota refusal, malformed create, or a refusal after create", async () => {
+    const cases: { hooks: FakeOptions["hooks"]; key?: string; code: string; artifacts: number }[] = [
+      { hooks: {}, key: OPERATOR_KEY, code: "invalid_api_key", artifacts: 0 },
+      { hooks: { create: () => apiError(429, "quota_exceeded") }, code: "quota_exceeded", artifacts: 0 },
+      { hooks: { create: () => "malformed-after-create" }, code: "bad_response", artifacts: 1 },
+      { hooks: { complete: () => apiError(409, "upload_protocol_unavailable") }, code: "upload_protocol_unavailable", artifacts: 1 },
+    ];
+    for (const { hooks, key, code, artifacts } of cases) {
+      await withFake({ gateway, hooks }, async (fake) => {
+        const result = await run(["share", notes, ...flags(fake), ...(key ? ["--api-key", key] : [])]);
+        assert.equal(result.json.error.code, code);
+        assert.deepEqual(createProtocols(fake), ["gateway-v1"]);
+        assert.equal(fake.artifacts.size, artifacts);
+        assert.equal(fake.requests.some((req) => req.server === "s3"), false);
       });
     }
   });

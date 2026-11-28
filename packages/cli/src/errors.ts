@@ -75,6 +75,8 @@ export class CliError extends Error {
   readonly status: number | undefined;
   /** Set when the failure came after create: the artifact may exist (it may even be published). */
   artifact: CreatedArtifact | undefined;
+  /** A previous create attempt with the same key may have stored the artifact. */
+  afterAmbiguousCreate = false;
   private constructor(code: string, message: string, exitCode: FailureExitCode, fix: string, details?: Record<string, unknown>, status?: number, docs?: string) {
     super(message);
     this.code = code;

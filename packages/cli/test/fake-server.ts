@@ -51,9 +51,25 @@ export interface FakeOptions {
   /** Upload URL base (defaults to the fake S3 server). */
   uploadBase?: string;
   apiKeys?: string[];
-  gateway?: { force?: boolean; ttlSeconds?: number; dataOrigin?: string; statusOrigin?: string };
+  gateway?: {
+    force?: boolean;
+    ttlSeconds?: number;
+    dataOrigin?: string;
+    statusOrigin?: string;
+    limits?: { anonymous: boolean; api_key: boolean; single_request_max_bytes: number };
+    admission?: "off" | "keys" | "all";
+    accountKeys?: string[];
+  };
   /** A create hook can return "drop-after-create" to store the artifact and lose its response. */
-  hooks?: { create?: Hook<"drop-after-create">; uploads?: Hook; complete?: Hook; delete?: Hook; put?: Hook; gatewayPut?: Hook<"drop-after-put"> };
+  hooks?: {
+    limits?: Hook;
+    create?: Hook<"drop-after-create" | "malformed-after-create">;
+    uploads?: Hook;
+    complete?: Hook;
+    delete?: Hook;
+    put?: Hook;
+    gatewayPut?: Hook<"drop-after-put">;
+  };
   /** Milliseconds each PUT takes after it was accepted (a slow upload). */
   putDelayMs?: number;
   /** Include a signed content-length header in every upload instruction, as production R2 does. */
@@ -182,22 +198,41 @@ export async function startFake(options: FakeOptions = {}): Promise<Fake> {
     };
     const run = (hook: Hook | undefined, name: string) => respond(hook?.(rec, { artifact, attempt: attempt(`${name}:${parts[2] ?? ""}`) }));
 
+    if (req.method === "GET" && url.pathname === "/v1/limits") {
+      if (run(hooks.limits, "limits")) return;
+      const limits = options.gateway?.limits;
+      return send(res, 200, limits ? { upload_protocols: { "gateway-v1": limits } } : {});
+    }
     if (req.method === "POST" && url.pathname === "/v1/artifacts") {
       const hook = hooks.create?.(rec, { attempt: attempt("create:") });
-      if (hook !== "drop-after-create" && respond(hook)) return;
+      if (hook !== "drop-after-create" && hook !== "malformed-after-create" && respond(hook)) return;
       if (req.headers["content-type"] !== "application/json") return send(res, 415, apiError("unsupported_media_type", "json please"));
-      if (auth !== null && !(options.apiKeys ?? []).includes(auth)) return send(res, 401, apiError("invalid_api_key", "The API key is malformed, unknown or revoked."));
+      const accountKey = auth !== null && (options.gateway?.accountKeys ?? []).includes(auth);
+      if (auth !== null && !(options.apiKeys ?? []).includes(auth) && !accountKey) {
+        return send(res, 401, apiError("invalid_api_key", "The API key is malformed, unknown or revoked."));
+      }
       const manifest = body.toString("utf8");
       const key = req.headers["idempotency-key"];
       const replayKey = key ? JSON.stringify([auth, key, manifest]) : null;
       const replay = replayKey ? creates.get(replayKey) : undefined;
       if (replay) return send(res, 201, replay, { "idempotent-replayed": "true" });
-      const input = JSON.parse(manifest) as { type: "file" | "site"; access?: string; ttl_seconds?: number; persistent?: boolean; files: FakeFile[] };
+      const input = JSON.parse(manifest) as { type: "file" | "site"; access?: string; ttl_seconds?: number; persistent?: boolean; files: FakeFile[]; upload_protocol?: string };
       if (input.persistent && auth === null) {
         return send(res, 403, apiError("persistent_requires_api_key", "Persistent artifacts need an API key.", undefined,
           "Send an API key as `Authorization: Bearer ihk_…`, or drop `persistent` and set `ttl_seconds`."));
       }
-      const gateway = options.gateway?.force ? { credential: token("ihu"), until: Date.now() + (options.gateway.ttlSeconds ?? 900) * 1000 } : null;
+      const requestedGateway = input.upload_protocol === "gateway-v1";
+      const policy = options.gateway;
+      if (requestedGateway) {
+        if (!policy?.limits) return send(res, 400, apiError("upload_protocol_unsupported", "The gateway is unknown."));
+        const reason = accountKey ? "operator_key_required" : policy.admission === "off" ? "disabled"
+          : auth === null && policy.admission === "keys" ? "api_key_required" : null;
+        if (reason) return send(res, 409, apiError("upload_protocol_unavailable", "The gateway is unavailable.", { reason }));
+        if (input.files.some((file) => file.size > policy.limits!.single_request_max_bytes)) {
+          return send(res, 413, apiError("gateway_file_too_large", "File too large for the gateway."));
+        }
+      }
+      const gateway = requestedGateway || policy?.force ? { credential: token("ihu"), until: Date.now() + (policy?.ttlSeconds ?? 900) * 1000 } : null;
       const a: FakeArtifact = {
         id: newId(),
         type: input.type,
@@ -237,6 +272,7 @@ export async function startFake(options: FakeOptions = {}): Promise<Fake> {
       }
       if (replayKey) creates.set(replayKey, out);
       if (hook === "drop-after-create") return void req.socket.destroy();
+      if (hook === "malformed-after-create") return send(res, 201, { artifact: view(a), delete_token: a.deleteToken });
       return send(res, 201, out);
     }
     if (!artifact) return send(res, 404, apiError("not_found", "No such artifact."));
