@@ -39,12 +39,13 @@ type JsonCallOptions = {
   /** Bearer credential (delete token or API key); sent only to the API origin. */
   token?: string | null;
   upload?: never;
-} & ({ phase: "create"; idempotencyKey: string } | { phase: Exclude<Phase, "create"> });
+} & ({ phase: "create"; idempotencyKey: string; retry?: never } | { phase: Exclude<Phase, "create">; retry?: false });
 
 type UploadCallOptions = {
   phase: "publish";
   token: string;
   body?: never;
+  retry?: never;
   upload: { open: () => Promise<Blob>; path: string; until: number };
 };
 
@@ -155,7 +156,7 @@ export class ApiClient {
     let ambiguousCreate = false;
 
     for (let attempt = 0; ; attempt++) {
-      const backoff = BACKOFF_SECONDS[attempt];
+      const backoff = options.retry === false ? undefined : BACKOFF_SECONDS[attempt];
       if (upload && Date.now() >= upload.until) throw uploadEnded();
       const bytes = await upload?.open();
       if (bytes) headers["content-length"] = String(bytes.size);
@@ -238,9 +239,11 @@ export class ApiClient {
       const sent = options.token ? (this.#credentialSource ?? "unknown") : null;
       const fix = override?.fix ?? cliFix(apiFix, options.phase, details, sent)
         ?? (typeof apiFix === "string" && apiFix.length > 0 && apiFix.length <= 500 ? apiFix : undefined);
-      throw CliError.api(code, message, res.status, options.phase,
+      const error = CliError.api(code, message, res.status, options.phase,
         retryAfter === null ? details : { ...details, retry_after_seconds: retryAfter },
         { fix, docs: errorDocs(envelope?.docs, this.apiUrl) });
+      error.afterAmbiguousCreate = ambiguousCreate;
+      throw error;
     }
   }
 }

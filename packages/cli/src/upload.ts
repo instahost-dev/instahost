@@ -174,11 +174,52 @@ export function checkCreated(created: unknown): asserts created is CreateRespons
     || upload.batch_size < 1 || typeof upload.uploads_url !== "string") throw invalid();
 }
 
-/** Give each invocation one create key for the original request and any retries. */
-export async function createArtifact(client: ApiClient, body: unknown, token: string | null): Promise<CreateResponse> {
-  const created = await client.call<CreateResponse>("POST", "/v1/artifacts", { body, token, phase: "create", idempotencyKey: randomUUID() });
-  checkCreated(created);
-  return created;
+interface CreateBody {
+  type: AuthorizedArtifact["type"];
+  access?: AuthorizedArtifact["access"];
+  ttl_seconds?: number;
+  persistent?: true;
+  files: { path: string; size: number; md5: string; content_type?: string }[];
+}
+
+interface GatewayLimits {
+  upload_protocols?: {
+    "gateway-v1"?: { anonymous?: unknown; api_key?: unknown; single_request_max_bytes?: unknown };
+  };
+}
+
+async function offersGateway(client: ApiClient, files: CreateBody["files"], hasKey: boolean): Promise<boolean> {
+  const limits = await client.call<GatewayLimits>("GET", "/v1/limits", { phase: "publish", retry: false }).catch(() => null);
+  const gateway = limits?.upload_protocols?.["gateway-v1"];
+  const limit = gateway?.single_request_max_bytes;
+  return gateway?.[hasKey ? "api_key" : "anonymous"] === true
+    && typeof limit === "number" && Number.isSafeInteger(limit) && limit >= 0
+    && files.every((file) => file.size <= limit);
+}
+
+const PROTOCOL_REFUSALS = new Map([
+  ["upload_protocol_unsupported", 400],
+  ["upload_protocol_unavailable", 409],
+  ["gateway_file_too_large", 413],
+]);
+
+export async function createArtifact(client: ApiClient, body: CreateBody, token: string | null): Promise<CreateResponse> {
+  const create = async (request: CreateBody & { upload_protocol?: "gateway-v1" }) => {
+    // Retries use the same serialized body and key. A different protocol creates a different artifact.
+    const created = await client.call<CreateResponse>("POST", "/v1/artifacts", { body: request, token, phase: "create", idempotencyKey: randomUUID() });
+    checkCreated(created);
+    return created;
+  };
+  if (await offersGateway(client, body.files, token !== null)) {
+    try {
+      return await create({ ...body, upload_protocol: "gateway-v1" });
+    } catch (err) {
+      if (!(err instanceof CliError) || err.afterAmbiguousCreate || err.status === undefined
+        || PROTOCOL_REFUSALS.get(err.code) !== err.status) throw err;
+      client.log(`create: gateway refused (${err.code}); using presigned uploads`);
+    }
+  }
+  return create(body);
 }
 
 /** The fields read from a published artifact. */
